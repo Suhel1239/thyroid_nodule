@@ -36,10 +36,8 @@ from PIL import Image
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# ── USFM repo path — must be importable ──────────────────────────────────────
+# ── USFM repo path ────────────────────────────────────────────────────────────
 USFM_REPO = "/root/autodl-tmp/suhel/thyroid_nodule/USFM"
-if USFM_REPO not in sys.path:
-    sys.path.insert(0, USFM_REPO)
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
@@ -258,15 +256,21 @@ def _load_usfm_native(ckpt_path: str) -> nn.Module:
     Build USFM's own VisionTransformer and load finetuned weights directly.
     No key remapping needed — the checkpoint keys match exactly.
     USFM handles mean pooling internally (use_mean_pooling=True).
+
+    Uses importlib to load directly from the file path, avoiding conflicts
+    with any 'models' package already installed in the environment.
     """
-    try:
-        from models.vision_transformer import VisionTransformer
-    except ImportError as e:
-        raise ImportError(
-            f"Could not import USFM VisionTransformer from {USFM_REPO}.\n"
-            f"Make sure {USFM_REPO} exists and contains models/vision_transformer.py.\n"
-            f"Original error: {e}"
+    import importlib.util
+    vit_path = os.path.join(USFM_REPO, "models", "vision_transformer.py")
+    if not os.path.exists(vit_path):
+        raise FileNotFoundError(
+            f"USFM VisionTransformer not found at: {vit_path}\n"
+            f"Make sure USFM_REPO ({USFM_REPO}) is correct."
         )
+    spec = importlib.util.spec_from_file_location("usfm_vit", vit_path)
+    usfm_vit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(usfm_vit)
+    VisionTransformer = usfm_vit.VisionTransformer
 
     model = VisionTransformer(
         img_size=224,
