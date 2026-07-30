@@ -57,8 +57,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 # Override via environment variable if needed.
 USFM_FINETUNED_CKPT = os.environ.get(
     "USFM_FINETUNED_CKPT",
-    "/root/autodl-tmp/suhel/thyroid_nodule/USFM/outputs/finetune/Cls/"
-    "thyroid_nodule/vit/USFM/checkpoints/best.ckpt",
+    "/root/autodl-tmp/suhel/thyroid_nodule/USFM/logs/finetune/Cls/"
+    "thyroid_nodule/vit/USFM/2026-07-30_16-09-49/outputs/best_ckpt.pth",
 )
 USFM_EMBED_DIM = 768   # ViT-Base/16 hidden dim
 
@@ -691,8 +691,8 @@ def evaluate_test_set(
 def main():
     DATA_ROOT      = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
     ROI_ROOT       = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
-    SAVE_BEST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_USFM_official_best_b2_rfdetr.pth"
-    SAVE_LAST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_USFM_official_last_b2_rfdetr.pth"
+    SAVE_BEST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_USFM_best_32_b2_rfdetr.pth"
+    SAVE_LAST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_USFM_last_32_b2_rfdetr.pth"
 
     BATCH_SIZE          = 2
     MAX_FRAMES          = 32
