@@ -267,6 +267,9 @@ def _load_usfm_native(ckpt_path: str) -> nn.Module:
             f"USFM VisionTransformer not found at: {vit_path}\n"
             f"Make sure USFM_REPO ({USFM_REPO}) is correct."
         )
+    # usdsgen itself must be on sys.path for vision_transformer.py's internal imports
+    if USFM_REPO not in sys.path:
+        sys.path.insert(0, USFM_REPO)
     spec = importlib.util.spec_from_file_location("usfm_vit", vit_path)
     usfm_vit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(usfm_vit)
