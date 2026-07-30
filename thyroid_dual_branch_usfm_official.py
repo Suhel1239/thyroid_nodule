@@ -273,17 +273,63 @@ class ThyroidDualDataset(Dataset):
 # 2. USFM Frame Encoder
 # ─────────────────────────────────────────────────────────────────────
 
+def _remap_usfm_to_timm(sd: dict) -> dict:
+    """
+    Remap USFM official VisionTransformer keys → timm ViT-Base/16 keys.
+
+    Key differences in USFM's custom ViT:
+      - No pos_embed (uses relative position bias instead)
+      - q_bias + v_bias separately  →  qkv.bias (concatenated as [q,0,v])
+      - gamma_1 / gamma_2           →  ls1.gamma / ls2.gamma  (layer scale)
+      - fc_norm                     →  norm
+      - head.*                      →  dropped (timm num_classes=0 has no head)
+      - relative_position_*         →  kept as-is (timm has matching keys)
+    """
+    out = {}
+    for k, v in sd.items():
+        # drop classification head — timm num_classes=0 has no head
+        if k in ("head.weight", "head.bias"):
+            continue
+
+        # fc_norm → norm  (timm's final LayerNorm)
+        if k in ("fc_norm.weight", "fc_norm.bias"):
+            out[k.replace("fc_norm.", "norm.")] = v
+            continue
+
+        # layer scale: gamma_1/gamma_2 → ls1.gamma/ls2.gamma
+        k2 = k.replace(".gamma_1", ".ls1.gamma").replace(".gamma_2", ".ls2.gamma")
+
+        out[k2] = v
+
+    # reconstruct qkv.bias from separate q_bias and v_bias
+    # timm fuses Q,K,V bias as a single (3*head_dim,) vector: [q_bias, 0..0, v_bias]
+    processed_blocks = set()
+    for k in list(out.keys()):
+        m = None
+        if ".attn.q_bias" in k:
+            prefix = k.split(".attn.q_bias")[0]   # e.g. "blocks.0"
+            if prefix in processed_blocks:
+                continue
+            processed_blocks.add(prefix)
+            q_bias = out.pop(f"{prefix}.attn.q_bias")
+            v_bias = out.pop(f"{prefix}.attn.v_bias", torch.zeros_like(q_bias))
+            k_bias = torch.zeros_like(q_bias)
+            out[f"{prefix}.attn.qkv.bias"] = torch.cat([q_bias, k_bias, v_bias])
+
+    return out
+
+
 def _load_usfm_finetuned(ckpt_path: str) -> nn.Module:
     """
-    Load USFM finetuned weights into a timm ViT-Base/16.
+    Load USFM official finetuned weights into a timm ViT-Base/16.
 
-    Handles four checkpoint formats automatically:
-      1. Lightning .ckpt  : {"state_dict": {"model.patch_embed...": ...}}
-         Keys are stripped of "model." prefix; head keys are dropped.
-      2. Merged encoder   : {"encoder": <timm ViT state_dict>}
-         Produced by finetune_usfm_lora.py _save_encoder().
-      3. USFM pretrained  : {"model": ...} or {"image_encoder": ...}
-      4. Plain state dict : {key: tensor}
+    The USFM official checkpoint format (from their main.py trainer):
+        {"model": <custom VisionTransformer state_dict>, "optimizer": ..., ...}
+
+    Also handles:
+      - {"encoder": sd}  from finetune_usfm_lora.py _save_encoder()
+      - {"state_dict": sd}  Lightning checkpoint
+      - bare state dict
     """
     try:
         import timm
@@ -303,34 +349,22 @@ def _load_usfm_finetuned(ckpt_path: str) -> nn.Module:
 
     raw = torch.load(ckpt_path, map_location="cpu")
 
-    # ── unwrap checkpoint format ──────────────────────────────────────
+    # ── unwrap top-level wrapper ──────────────────────────────────────
     if isinstance(raw, dict):
-        if "state_dict" in raw:
-            # Lightning checkpoint — strip "model." prefix, drop head keys
+        if "model" in raw and "optimizer" in raw:
+            # USFM official trainer checkpoint
+            sd = raw["model"]
+            sd = _remap_usfm_to_timm(sd)
+        elif "encoder" in raw:
+            sd = raw["encoder"]
+        elif "state_dict" in raw:
             sd = raw["state_dict"]
             sd = {k[len("model."):]: v for k, v in sd.items()
                   if k.startswith("model.") and not k.startswith("model.head")}
-            # also try "backbone." sub-prefix
-            if not sd:
-                sd = raw["state_dict"]
-        elif "encoder" in raw:
-            # our merged encoder format
-            sd = raw["encoder"]
-        elif "model" in raw:
-            sd = raw["model"]
-        elif "image_encoder" in raw:
-            sd = raw["image_encoder"]
         else:
             sd = raw
     else:
         sd = raw
-
-    # ── strip common prefixes ─────────────────────────────────────────
-    for prefix in ("backbone.", "encoder.", "module.", "vit."):
-        if any(k.startswith(prefix) for k in sd):
-            sd = {k[len(prefix):]: v for k, v in sd.items()
-                  if k.startswith(prefix)}
-            break
 
     missing, unexpected = backbone.load_state_dict(sd, strict=False)
     n_total  = len(backbone.state_dict())
@@ -341,8 +375,8 @@ def _load_usfm_finetuned(ckpt_path: str) -> nn.Module:
     if missing:
         print(f"  missing (first 4): {missing[:4]}"
               + (" ..." if len(missing) > 4 else ""))
-    if n_loaded < n_total * 0.5:
-        print("  [WARNING] Less than 50% of weights loaded — "
+    if n_loaded < n_total * 0.8:
+        print("  [WARNING] Less than 80% of weights loaded — "
               "check checkpoint format / key names.")
 
     backbone.hidden_dim = backbone.embed_dim   # 768
