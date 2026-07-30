@@ -699,11 +699,12 @@ def main():
     IMG_SIZE            = 224
     ROI_SIZE            = 224
     EPOCHS              = 50
-    LR                  = 3e-4
+    LR                  = 1e-4      # head/temporal LR
+    BACKBONE_LR         = 5e-6     # last-2-block backbone LR
     WEIGHT_DECAY        = 1e-4
-    FREEZE_BACKBONE     = True
+    FREEZE_BACKBONE     = False     # unfreeze last 2 blocks via param groups
     DROPOUT             = 0.3
-    WARMUP_EPOCHS       = 5
+    WARMUP_EPOCHS       = 3
     EARLY_STOP_PATIENCE = 10
     NUM_WORKERS         = 4
 
@@ -734,16 +735,40 @@ def main():
         dropout=DROPOUT,
     ).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {n_params:,}\n")
-
     counts    = np.bincount([lbl for _, _, lbl in train_ds.samples])
     weights   = torch.tensor(1.0 / counts.astype(float),
                              dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    params    = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
+    # Freeze all backbone params first, then selectively unfreeze last 2 blocks
+    for p in model.parameters():
+        p.requires_grad = False
+    # Unfreeze last 2 transformer blocks + norm in each branch encoder
+    for encoder in (model.branch_a.encoder, model.branch_b.encoder):
+        for blk in encoder.backbone.blocks[-2:]:
+            for p in blk.parameters():
+                p.requires_grad = True
+        for p in encoder.backbone.norm.parameters():
+            p.requires_grad = True
+    # Always train temporal transformers, fusion MLP, heads
+    for name, p in model.named_parameters():
+        if any(k in name for k in ("temporal", "fusion", "classifier", "norm_a", "norm_b")):
+            p.requires_grad = True
+
+    backbone_params = []
+    head_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "backbone" in name:
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": head_params,     "lr": LR,          "weight_decay": WEIGHT_DECAY},
+        {"params": backbone_params, "lr": BACKBONE_LR, "weight_decay": WEIGHT_DECAY},
+    ])
 
     def lr_lambda(epoch):
         if epoch < WARMUP_EPOCHS:
@@ -753,6 +778,11 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {n_params:,}  "
+          f"(head={len(head_params)} groups @ lr={LR}, "
+          f"backbone_last2={len(backbone_params)} groups @ lr={BACKBONE_LR})\n")
 
     os.makedirs(os.path.dirname(SAVE_BEST_PATH), exist_ok=True)
     os.makedirs(os.path.dirname(SAVE_LAST_PATH), exist_ok=True)
