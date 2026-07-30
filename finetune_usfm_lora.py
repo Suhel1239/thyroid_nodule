@@ -484,6 +484,9 @@ def main():
             best_auc   = auc
             no_improve = 0
             _save(model, best_ckpt, args)
+            # also export merged encoder weights for reuse in other tasks
+            encoder_ckpt = os.path.join(args.save_dir, "usfm_encoder_merged_best.pth")
+            _save_encoder(model, encoder_ckpt)
             print(f"  => Best model saved  (AUC={best_auc:.4f})")
         else:
             no_improve += 1
@@ -502,16 +505,53 @@ def main():
         tm = evaluate(model, loaders["test"], criterion, device)
         test_report(tm, class_names, args.results_csv)
 
+    # ── final encoder export ──────────────────────────────────────────
+    # Reload best weights and export a clean merged encoder checkpoint
+    # that can be dropped into any other pipeline (e.g. dual-branch video
+    # classifier) without needing peft installed.
+    _load(model, best_ckpt, device)
+    final_encoder_ckpt = os.path.join(args.save_dir, "usfm_encoder_merged_final.pth")
+    _save_encoder(model, final_encoder_ckpt)
+    print(f"\nMerged encoder saved -> {final_encoder_ckpt}")
+    print("Load it in another script with:")
+    print("  vit = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0)")
+    print(f"  vit.load_state_dict(torch.load('{final_encoder_ckpt}')['encoder'])")
+
 
 def _save(model: nn.Module, path: str, args):
-    """Save model weights + LoRA config so the checkpoint is self-contained."""
+    """Full checkpoint: state_dict + training args."""
     payload = {"state_dict": model.state_dict(), "args": vars(args)}
     torch.save(payload, path)
 
 
+def _save_encoder(model: nn.Module, path: str):
+    """
+    Export only the ViT encoder weights with LoRA merged in.
+
+    After merging, the saved weights are plain ViT-Base/16 weights —
+    no peft dependency needed to load them.  The file contains:
+        {
+          "encoder":   <merged ViT state_dict>,   # drop-in backbone
+          "head":      <classifier head state_dict>,
+        }
+    """
+    encoder = model.encoder
+
+    # merge LoRA deltas into the base weights (peft helper)
+    if PEFT_AVAILABLE and hasattr(encoder, "merge_adapter"):
+        encoder = encoder.merge_and_unload()   # returns a plain nn.Module
+
+    payload = {
+        "encoder": encoder.state_dict(),
+        "head":    model.head.state_dict(),
+    }
+    torch.save(payload, path)
+    print(f"  [export] Merged encoder weights -> {path}")
+
+
 def _load(model: nn.Module, path: str, device):
     payload = torch.load(path, map_location=device)
-    sd = payload["state_dict"] if "state_dict" in payload else payload
+    sd = payload.get("state_dict", payload)
     model.load_state_dict(sd, strict=True)
 
 
