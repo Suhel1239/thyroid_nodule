@@ -340,6 +340,7 @@ def _load_usfm_finetuned(ckpt_path: str) -> nn.Module:
         "vit_base_patch16_224",
         pretrained=False,
         num_classes=0,
+        global_pool='',   # disable timm pooling — we use mean pooling manually
     )
 
     if not Path(ckpt_path).exists():
@@ -396,11 +397,13 @@ class USFMFrameEncoder(nn.Module):
     Per-frame feature extractor using finetuned USFM weights.
 
     Input : (B, 3, 224, 224)
-    Output: (B, 768)  — CLS token from timm ViT-Base/16
+    Output: (B, 768)  — mean of patch tokens (matching USFM's use_mean_pooling=True)
+
+    USFM was finetuned with use_mean_pooling=True, meaning it averages all patch
+    token outputs (not the CLS token) to produce the final representation.
+    Using CLS token here would read the wrong features from the checkpoint.
 
     Shared between Branch A (whole frames) and Branch B (ROI crops).
-    freeze=True keeps backbone weights fixed; only TemporalTransformer
-    and fusion head are trained.
     """
 
     def __init__(self, ckpt_path: str = USFM_FINETUNED_CKPT, freeze: bool = True):
@@ -417,10 +420,11 @@ class USFMFrameEncoder(nn.Module):
             print(f"[USFMFrameEncoder] Backbone unfrozen ({n:,} params).")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.backbone(x)   # (B, 768) — timm num_classes=0 returns CLS token
-        if out.ndim == 3:        # safety: (B, T, D) → CLS at index 0
-            out = out[:, 0]
-        return out               # (B, 768)
+        # forward_features returns (B, 197, 768): index 0 = CLS, 1: = patch tokens
+        # USFM uses mean pooling over patch tokens (use_mean_pooling=True)
+        tokens = self.backbone.forward_features(x)  # (B, 197, 768)
+        out = tokens[:, 1:].mean(dim=1)             # (B, 768) — mean of 196 patches
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────
