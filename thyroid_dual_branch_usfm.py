@@ -1,22 +1,28 @@
 ############## With Early Stopping ##########################
 """
-Thyroid Nodule Video Classification — Dual-Branch v5 (USFM)
-============================================================
+Thyroid Nodule Video Classification — Dual-Branch v5 (USFM finetuned)
+======================================================================
 Requires ROI crops to be pre-extracted first:
     python preextract_rois.py
 
 Pipeline:
-  Branch A (whole frame): video frames → USFM → TemporalTransformer → (B, EMBED_DIM)
-  Branch B (ROI crops)  : pre-saved crops → USFM → TemporalTransformer → (B, EMBED_DIM)
+  Branch A (whole frame): video frames → USFM encoder → TemporalTransformer → (B, 768)
+  Branch B (ROI crops)  : pre-saved crops → USFM encoder → TemporalTransformer → (B, 768)
   Fusion                : concat → LayerNorm → MLP → Benign/Malignant
 
-USFM (Ultrasound Foundation Model) replaces ViT-B/16 as the per-frame encoder.
-USFM is a large vision-language model pre-trained on ultrasound images; its image
-encoder produces patch embeddings compatible with the TemporalTransformer used here.
+The per-frame encoder uses USFM weights that have been fine-tuned on ultrasound
+image classification via LoRA (see finetune_usfm_lora.py).  The finetuned
+checkpoint is exported by _save_encoder() / merge_and_unload() and contains:
+    {
+      "encoder": <plain timm ViT-Base/16 state dict with LoRA merged in>,
+      "head":    <classification head — not used here>,
+    }
 
-The USFM checkpoint is loaded from a local path (USFM_CKPT) or from HuggingFace
-(set USFM_HF_REPO to the hub repo id).  The encoder exposes a 768-d CLS token by
-default; if your checkpoint uses a different hidden dim set USFM_EMBED_DIM.
+This merged state dict loads directly into timm.create_model("vit_base_patch16_224")
+without requiring the peft library.
+
+Normalization uses ImageNet statistics (mean=[0.485,0.456,0.406],
+std=[0.229,0.224,0.225]), matching what finetune_usfm_lora.py used during training.
 
 [CHANGE] Variable-length ROI manifests are supported:
   _load_roi_frames() reads however many .jpg files are in the manifest and
@@ -48,13 +54,16 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
-# ── USFM configuration ───────────────────────────────────────────────────────
-# Set USFM_CKPT to a local .pth / .bin checkpoint, or leave as None to load
-# from HuggingFace using USFM_HF_REPO.
-USFM_CKPT      = os.environ.get("USFM_CKPT", None)          # e.g. "/path/to/usfm.pth"
-USFM_HF_REPO   = os.environ.get("USFM_HF_REPO",
-                                 "mkaichristensen/USFM")      # HuggingFace repo id
-USFM_EMBED_DIM = int(os.environ.get("USFM_EMBED_DIM", 768))  # CLS token hidden dim
+# ── Finetuned USFM checkpoint ────────────────────────────────────────────────
+# Path to the merged encoder checkpoint produced by finetune_usfm_lora.py.
+# Use usfm_encoder_merged_best.pth (best val AUC) or
+#     usfm_encoder_merged_final.pth (same, re-exported after training).
+# Override via the USFM_FINETUNED_CKPT environment variable if needed.
+USFM_FINETUNED_CKPT = os.environ.get(
+    "USFM_FINETUNED_CKPT",
+    "/root/autodl-tmp/suhel/thyroid_nodule/USFM/finetuned_ckpts/usfm_encoder_merged_best.pth",
+)
+USFM_EMBED_DIM = 768   # ViT-Base/16 hidden dim (fixed)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -267,112 +276,93 @@ class ThyroidDualDataset(Dataset):
 # 2. USFM Frame Encoder  (shared across both branches)
 # ─────────────────────────────────────────────────────────────────────
 
-def _load_usfm_backbone() -> nn.Module:
+def _load_finetuned_usfm(ckpt_path: str) -> nn.Module:
     """
-    Load the USFM image encoder.
+    Build a timm ViT-Base/16 and load weights from a finetuned USFM checkpoint.
 
-    USFM (Ultrasound Foundation Model) is distributed as a Vision Transformer
-    pretrained on large-scale ultrasound data.  The image encoder is a standard
-    ViT whose forward() returns (B, num_patches+1, hidden_dim); we extract the
-    CLS token at index 0.
+    The checkpoint is the merged encoder file produced by finetune_usfm_lora.py:
+        torch.save({"encoder": encoder.state_dict(), "head": ...}, path)
 
-    Loading order:
-      1. Local checkpoint at USFM_CKPT (env var or module-level constant).
-      2. HuggingFace hub repo USFM_HF_REPO using transformers AutoModel.
-
-    The function returns the bare image-encoder nn.Module with attribute
-    `hidden_dim` set to the CLS token dimension.
+    Because merge_and_unload() was called before saving, the state dict
+    contains plain ViT weights (no peft/LoRA wrappers) and loads with
+    strict=True.  timm's num_classes=0 returns the CLS token as (B, 768).
     """
-    if USFM_CKPT and Path(USFM_CKPT).exists():
-        # ── local checkpoint ─────────────────────────────────────────
-        # Expects the checkpoint to contain either:
-        #   { "image_encoder": state_dict }  or  a bare state_dict
-        # and the architecture to be a timm ViT-Base (patch16, img224).
-        try:
-            import timm
-        except ImportError as e:
-            raise ImportError(
-                "timm is required to load USFM from a local checkpoint. "
-                "Install with:  pip install timm") from e
-
-        backbone = timm.create_model(
-            "vit_base_patch16_224",
-            pretrained=False,
-            num_classes=0,          # drop classification head → CLS output
-        )
-        state = torch.load(USFM_CKPT, map_location="cpu")
-        if isinstance(state, dict) and "image_encoder" in state:
-            state = state["image_encoder"]
-        missing, unexpected = backbone.load_state_dict(state, strict=False)
-        if missing:
-            print(f"  [USFM] missing keys in checkpoint ({len(missing)}): "
-                  f"{missing[:5]} …")
-        backbone.hidden_dim = backbone.embed_dim   # timm uses embed_dim
-        print(f"  [USFM] Loaded local checkpoint: {USFM_CKPT}")
-        return backbone
-
-    # ── HuggingFace ──────────────────────────────────────────────────
     try:
-        from transformers import AutoModel, AutoConfig
+        import timm
     except ImportError as e:
         raise ImportError(
-            "transformers is required to load USFM from HuggingFace. "
-            "Install with:  pip install transformers") from e
+            "timm is required.  Install with:  pip install timm") from e
 
-    print(f"  [USFM] Loading from HuggingFace: {USFM_HF_REPO}")
-    config   = AutoConfig.from_pretrained(USFM_HF_REPO)
-    backbone = AutoModel.from_pretrained(USFM_HF_REPO)
-    # HF vision models expose hidden_size in config
-    backbone.hidden_dim = config.hidden_size
+    backbone = timm.create_model(
+        "vit_base_patch16_224",
+        pretrained=False,
+        num_classes=0,      # no classification head — returns CLS token (B, 768)
+    )
+
+    if not Path(ckpt_path).exists():
+        raise FileNotFoundError(
+            f"Finetuned USFM checkpoint not found: {ckpt_path}\n"
+            "Run finetune_usfm_lora.py first to produce "
+            "usfm_encoder_merged_best.pth or usfm_encoder_merged_final.pth")
+
+    raw = torch.load(ckpt_path, map_location="cpu")
+
+    # finetune_usfm_lora._save_encoder() format: {"encoder": sd, "head": sd}
+    if isinstance(raw, dict) and "encoder" in raw:
+        state_dict = raw["encoder"]
+    elif isinstance(raw, dict) and "state_dict" in raw:
+        # full model checkpoint from _save(); strip "encoder." prefix
+        state_dict = {
+            k[len("encoder."):]: v
+            for k, v in raw["state_dict"].items()
+            if k.startswith("encoder.")
+        }
+    else:
+        state_dict = raw   # bare state dict
+
+    missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
+    n_loaded = len(state_dict) - len(unexpected)
+    print(f"[USFMFrameEncoder] Loaded finetuned weights: {ckpt_path}")
+    print(f"  loaded={n_loaded}  missing={len(missing)}  unexpected={len(unexpected)}")
+    if missing:
+        print(f"  missing keys (random init): {missing[:4]}" +
+              (" ..." if len(missing) > 4 else ""))
+
+    backbone.hidden_dim = backbone.embed_dim   # 768 for ViT-Base
     return backbone
 
 
 class USFMFrameEncoder(nn.Module):
     """
-    Per-frame encoder backed by USFM.
+    Per-frame encoder backed by the finetuned USFM checkpoint.
 
     Input : (B, 3, 224, 224)
-    Output: (B, hidden_dim)  — CLS token
+    Output: (B, 768)  — CLS token from timm ViT-Base/16
 
     The backbone is shared between Branch A (whole frames) and Branch B
-    (ROI crops); freeze=True keeps USFM weights fixed during training so
-    only the TemporalTransformer and fusion head are updated.
+    (ROI crops); freeze=True keeps all encoder weights fixed during training
+    so only the TemporalTransformer and fusion head are updated.
     """
 
-    def __init__(self, freeze: bool = True):
+    def __init__(self, ckpt_path: str = USFM_FINETUNED_CKPT, freeze: bool = True):
         super().__init__()
-        self.backbone   = _load_usfm_backbone()
-        self.hidden_dim = getattr(self.backbone, "hidden_dim", USFM_EMBED_DIM)
+        self.backbone   = _load_finetuned_usfm(ckpt_path)
+        self.hidden_dim = self.backbone.hidden_dim   # 768
 
         if freeze:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+            print("[USFMFrameEncoder] Backbone frozen.")
+        else:
+            n = sum(p.numel() for p in self.backbone.parameters())
+            print(f"[USFMFrameEncoder] Backbone unfrozen ({n:,} params).")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x : (B, 3, 224, 224)
-        Returns (B, hidden_dim)
-        """
+        # timm ViT with num_classes=0 returns CLS token directly as (B, 768)
         out = self.backbone(x)
-
-        # timm ViT with num_classes=0 returns the CLS token directly as (B, D)
-        if isinstance(out, torch.Tensor):
-            if out.ndim == 2:
-                return out                  # already (B, D)
-            if out.ndim == 3:
-                return out[:, 0]            # (B, T, D) → CLS
-
-        # HuggingFace BaseModelOutput
-        if hasattr(out, "last_hidden_state"):
-            return out.last_hidden_state[:, 0]
-
-        # HuggingFace pooler_output (some vision models)
-        if hasattr(out, "pooler_output") and out.pooler_output is not None:
-            return out.pooler_output
-
-        raise ValueError(
-            f"Unrecognised USFM backbone output type: {type(out)}. "
-            "Override USFMFrameEncoder.forward() to handle your checkpoint.")
+        if out.ndim == 3:       # safety: (B, T, D) → take CLS at index 0
+            out = out[:, 0]
+        return out              # (B, 768)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -422,13 +412,13 @@ class DualBranchThyroidClassifier(nn.Module):
                  num_classes:     int   = 2,
                  max_frames:      int   = 32,
                  freeze_backbone: bool  = True,
-                 embed_dim:       int   = USFM_EMBED_DIM,
+                 usfm_ckpt:       str   = USFM_FINETUNED_CKPT,
                  temporal_heads:  int   = 8,
                  temporal_layers: int   = 2,
                  dropout:         float = 0.3):
         super().__init__()
 
-        self.frame_encoder  = USFMFrameEncoder(freeze=freeze_backbone)
+        self.frame_encoder  = USFMFrameEncoder(ckpt_path=usfm_ckpt, freeze=freeze_backbone)
         # use actual hidden dim from the loaded backbone
         embed_dim = self.frame_encoder.hidden_dim
 
@@ -551,7 +541,11 @@ def evaluate_test_set(
     print(f"{'=' * 60}\n")
 
     model = DualBranchThyroidClassifier(
-        max_frames=max_frames, freeze_backbone=True, dropout=dropout).to(device)
+        max_frames=max_frames,
+        freeze_backbone=True,
+        usfm_ckpt=USFM_FINETUNED_CKPT,
+        dropout=dropout,
+    ).to(device)
     state = torch.load(checkpoint, map_location=device)
     model.load_state_dict(state)
     model.eval()
@@ -687,7 +681,10 @@ def main():
                               collate_fn=collate_fn)
 
     model = DualBranchThyroidClassifier(
-        max_frames=MAX_FRAMES, freeze_backbone=FREEZE_BACKBONE, dropout=DROPOUT,
+        max_frames=MAX_FRAMES,
+        freeze_backbone=FREEZE_BACKBONE,
+        usfm_ckpt=USFM_FINETUNED_CKPT,
+        dropout=DROPOUT,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
