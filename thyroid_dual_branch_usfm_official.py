@@ -740,19 +740,18 @@ def main():
                              dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    # Freeze all backbone params first, then selectively unfreeze last 2 blocks
+    # Freeze all params, then selectively unfreeze last 2 backbone blocks + heads
     for p in model.parameters():
         p.requires_grad = False
-    # Unfreeze last 2 transformer blocks + norm in each branch encoder
-    for encoder in (model.branch_a.encoder, model.branch_b.encoder):
-        for blk in encoder.backbone.blocks[-2:]:
-            for p in blk.parameters():
-                p.requires_grad = True
-        for p in encoder.backbone.norm.parameters():
+    # Unfreeze last 2 transformer blocks + norm in shared frame_encoder
+    for blk in model.frame_encoder.backbone.blocks[-2:]:
+        for p in blk.parameters():
             p.requires_grad = True
-    # Always train temporal transformers, fusion MLP, heads
+    for p in model.frame_encoder.backbone.norm.parameters():
+        p.requires_grad = True
+    # Always train temporal transformers, fusion MLP, classifier
     for name, p in model.named_parameters():
-        if any(k in name for k in ("temporal", "fusion", "classifier", "norm_a", "norm_b")):
+        if any(k in name for k in ("temporal", "fusion", "classifier")):
             p.requires_grad = True
 
     backbone_params = []
@@ -760,7 +759,7 @@ def main():
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "backbone" in name:
+        if "frame_encoder.backbone" in name:
             backbone_params.append(p)
         else:
             head_params.append(p)
