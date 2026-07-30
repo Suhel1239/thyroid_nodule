@@ -261,7 +261,7 @@ def _load_usfm_native(ckpt_path: str) -> nn.Module:
     with any 'models' package already installed in the environment.
     """
     import importlib.util
-    vit_path = os.path.join(USFM_REPO, "models", "vision_transformer.py")
+    vit_path = os.path.join(USFM_REPO, "usdsgen", "modules", "backbone", "vision_transformer.py")
     if not os.path.exists(vit_path):
         raise FileNotFoundError(
             f"USFM VisionTransformer not found at: {vit_path}\n"
