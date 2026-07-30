@@ -379,6 +379,14 @@ def _load_usfm_finetuned(ckpt_path: str) -> nn.Module:
         print("  [WARNING] Less than 80% of weights loaded — "
               "check checkpoint format / key names.")
 
+    # USFM uses relative position bias (loaded above); timm's absolute pos_embed
+    # is NOT in the checkpoint and stays randomly initialized, which would add
+    # pure noise to every patch embedding. Zero it out so only the relative bias
+    # (already loaded) provides positional information.
+    with torch.no_grad():
+        backbone.pos_embed.zero_()
+    print("  pos_embed zeroed (USFM uses relative pos bias, not absolute).")
+
     backbone.hidden_dim = backbone.embed_dim   # 768
     return backbone
 
