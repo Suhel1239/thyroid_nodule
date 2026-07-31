@@ -37,6 +37,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
 EMBED_DIM = 768
 
+# Optional: path to finetuned ViT-B/16 backbone from finetune_vitb16_images.py
+# Leave as None to use plain ImageNet pretrained weights.
+VITB16_FINETUNED_CKPT = os.environ.get(
+    "VITB16_FINETUNED_CKPT",
+    "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/vitb16_finetuned_best.pth",
+)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Logger
@@ -227,7 +234,8 @@ class ViTFrameEncoder(nn.Module):
     Shared between Branch A (whole frames) and Branch B (ROI crops).
     """
 
-    def __init__(self, freeze: bool = True):
+    def __init__(self, freeze: bool = True,
+                 finetuned_ckpt: str = VITB16_FINETUNED_CKPT):
         super().__init__()
         self.backbone = timm.create_model(
             "vit_base_patch16_224",
@@ -235,6 +243,19 @@ class ViTFrameEncoder(nn.Module):
             num_classes=0,      # returns CLS token (B, 768)
         )
         self.hidden_dim = self.backbone.embed_dim  # 768
+
+        # Load finetuned backbone weights if available
+        if finetuned_ckpt and Path(finetuned_ckpt).exists():
+            sd = torch.load(finetuned_ckpt, map_location="cpu")
+            missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
+            n_total  = len(self.backbone.state_dict())
+            n_loaded = n_total - len(missing)
+            print(f"[ViTFrameEncoder] Loaded finetuned weights: {finetuned_ckpt}")
+            print(f"  {n_loaded}/{n_total} tensors loaded "
+                  f"| missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            print(f"[ViTFrameEncoder] Using ImageNet pretrained weights "
+                  f"(finetuned ckpt not found: {finetuned_ckpt})")
 
         if freeze:
             for p in self.backbone.parameters():
