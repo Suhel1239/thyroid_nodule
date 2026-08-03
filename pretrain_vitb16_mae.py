@@ -1,8 +1,14 @@
 """
 ViT-B/16 MAE Pretraining on Thyroid Nodule Images (no labels)
 ==============================================================
-Masked Autoencoder (MAE) self-supervised pretraining.
-Random patches are masked; the model learns to reconstruct them.
+Domain-adaptive self-supervised pretraining using Masked Autoencoders.
+
+Starts from ImageNet pretrained weights, then continues learning on your
+thyroid images — so the backbone keeps general visual features AND gains
+thyroid-specific texture/structure knowledge.
+
+Random patches are masked; the model must reconstruct them, forcing it to
+build representations tuned to thyroid ultrasound appearance.
 No category labels required — any folder of thyroid images will do.
 
 After pretraining, load the encoder backbone in your downstream scripts:
