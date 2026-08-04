@@ -1,8 +1,12 @@
 """
-Thyroid Nodule Video Classification — Dual-Branch (ViT-B/16 ImageNet pretrained)
-==================================================================================
-Uses timm's ViT-B/16 with ImageNet pretrained weights as the frame encoder.
-Simple, no custom checkpoints or remapping needed.
+Thyroid Nodule Video Classification — Dual-Branch (ViT-B/16)
+=============================================================
+Uses timm's ViT-B/16 as the frame encoder.
+
+Checkpoint priority (VITB16_FINETUNED_CKPT):
+  1. vitb16_mae_pretrained.pth  — MAE domain-adaptive pretraining on thyroid images
+  2. vitb16_finetuned_best.pth  — supervised fine-tune on benign/malignant images
+  3. Not set / not found        — falls back to plain ImageNet pretrained weights
 
 Pipeline:
   Branch A (whole frame): video frames → ViT-B/16 → TemporalTransformer → (B, 768)
@@ -37,11 +41,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
 EMBED_DIM = 768
 
-# Optional: path to finetuned ViT-B/16 backbone from finetune_vitb16_images.py
-# Leave as None to use plain ImageNet pretrained weights.
+# Path to pretrained backbone — set via env var or edit directly.
+# Can be MAE pretrained weights (vitb16_mae_pretrained.pth) or
+# supervised finetuned weights (vitb16_finetuned_best.pth).
+# Leave empty / point to missing file to use raw ImageNet weights.
 VITB16_FINETUNED_CKPT = os.environ.get(
     "VITB16_FINETUNED_CKPT",
-    "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/vitb16_finetuned_best.pth",
+    "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/vitb16_mae_pretrained.pth",
 )
 
 
@@ -226,36 +232,45 @@ class ThyroidDualDataset(Dataset):
 
 class ViTFrameEncoder(nn.Module):
     """
-    Per-frame feature extractor using timm ViT-B/16 (ImageNet pretrained).
+    Per-frame feature extractor using timm ViT-B/16.
+
+    If a custom checkpoint (MAE pretrained or supervised finetuned) exists,
+    the backbone is initialised WITHOUT ImageNet weights and then the custom
+    weights are loaded — so only your thyroid-adapted weights are used.
+
+    If no checkpoint is found, falls back to plain ImageNet pretrained weights.
 
     Input : (B, 3, 224, 224)
     Output: (B, 768)  — CLS token
-
-    Shared between Branch A (whole frames) and Branch B (ROI crops).
     """
 
     def __init__(self, freeze: bool = True,
                  finetuned_ckpt: str = VITB16_FINETUNED_CKPT):
         super().__init__()
+
+        ckpt_exists = finetuned_ckpt and Path(finetuned_ckpt).exists()
+
+        # Only pull ImageNet weights when no custom checkpoint is available.
+        # This avoids downloading and then immediately overwriting them.
         self.backbone = timm.create_model(
             "vit_base_patch16_224",
-            pretrained=True,
-            num_classes=0,      # returns CLS token (B, 768)
+            pretrained=not ckpt_exists,   # ← key fix
+            num_classes=0,                # returns CLS token (B, 768)
         )
         self.hidden_dim = self.backbone.embed_dim  # 768
 
-        # Load finetuned backbone weights if available
-        if finetuned_ckpt and Path(finetuned_ckpt).exists():
+        if ckpt_exists:
             sd = torch.load(finetuned_ckpt, map_location="cpu")
             missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
             n_total  = len(self.backbone.state_dict())
             n_loaded = n_total - len(missing)
-            print(f"[ViTFrameEncoder] Loaded finetuned weights: {finetuned_ckpt}")
-            print(f"  {n_loaded}/{n_total} tensors loaded "
+            print(f"[ViTFrameEncoder] Loaded custom weights: {finetuned_ckpt}")
+            print(f"  {n_loaded}/{n_total} keys loaded "
                   f"| missing={len(missing)} unexpected={len(unexpected)}")
         else:
-            print(f"[ViTFrameEncoder] Using ImageNet pretrained weights "
-                  f"(finetuned ckpt not found: {finetuned_ckpt})")
+            print(f"[ViTFrameEncoder] Custom checkpoint not found — "
+                  f"using ImageNet pretrained weights.")
+            print(f"  (looked for: {finetuned_ckpt})")
 
         if freeze:
             for p in self.backbone.parameters():
@@ -542,16 +557,16 @@ def evaluate_test_set(
 def main():
     DATA_ROOT      = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
     ROI_ROOT       = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
-    SAVE_BEST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_vitb16_best_32_b2_rfdetr.pth"
-    SAVE_LAST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_vitb16_last_32_b2_rfdetr.pth"
+    SAVE_BEST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_vitb16_best_32_b2_rfdetr.pth"
+    SAVE_LAST_PATH = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_vitb16_last_32_b2_rfdetr.pth"
 
     BATCH_SIZE          = 2
     MAX_FRAMES          = 32
     IMG_SIZE            = 224
     ROI_SIZE            = 224
     EPOCHS              = 50
-    LR                  = 1e-4      # head / temporal LR
-    BACKBONE_LR         = 5e-6     # last-2-block backbone LR
+    LR                  = 1e-4
+    BACKBONE_LR         = 5e-6
     WEIGHT_DECAY        = 1e-4
     DROPOUT             = 0.3
     WARMUP_EPOCHS       = 3
@@ -578,10 +593,9 @@ def main():
                               num_workers=NUM_WORKERS, pin_memory=True,
                               collate_fn=collate_fn)
 
-    # Build model with backbone initially frozen — we unfreeze last 2 blocks below
     model = DualBranchThyroidClassifier(
         max_frames=MAX_FRAMES,
-        freeze_backbone=True,   # freeze all first, then selectively unfreeze
+        freeze_backbone=True,
         dropout=DROPOUT,
     ).to(device)
 
@@ -590,26 +604,20 @@ def main():
                              dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    # Selectively unfreeze last 2 transformer blocks + norm for fine-tuning
+    # Unfreeze last 2 transformer blocks + norm for fine-tuning
     for blk in model.frame_encoder.backbone.blocks[-2:]:
         for p in blk.parameters():
             p.requires_grad = True
     for p in model.frame_encoder.backbone.norm.parameters():
         p.requires_grad = True
-    # Always train temporal transformers and fusion head
     for name, p in model.named_parameters():
         if any(k in name for k in ("temporal", "fusion", "classifier")):
             p.requires_grad = True
 
-    backbone_params = []
-    head_params     = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if "frame_encoder.backbone" in name:
-            backbone_params.append(p)
-        else:
-            head_params.append(p)
+    backbone_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and "frame_encoder.backbone" in n]
+    head_params     = [p for n, p in model.named_parameters()
+                       if p.requires_grad and "frame_encoder.backbone" not in n]
 
     optimizer = torch.optim.AdamW([
         {"params": head_params,     "lr": LR,          "weight_decay": WEIGHT_DECAY},
@@ -630,10 +638,8 @@ def main():
           f"(head @ lr={LR}, backbone_last2 @ lr={BACKBONE_LR})\n")
 
     os.makedirs(os.path.dirname(SAVE_BEST_PATH), exist_ok=True)
-    os.makedirs(os.path.dirname(SAVE_LAST_PATH), exist_ok=True)
 
-    best_auc   = 0.0
-    no_improve = 0
+    best_auc, no_improve = 0.0, 0
 
     for epoch in range(1, EPOCHS + 1):
         train_loss  = train_one_epoch(model, train_loader, optimizer,
@@ -651,8 +657,7 @@ def main():
         torch.save(model.state_dict(), SAVE_LAST_PATH)
 
         if val_metrics["auc"] > best_auc:
-            best_auc   = val_metrics["auc"]
-            no_improve = 0
+            best_auc, no_improve = val_metrics["auc"], 0
             torch.save(model.state_dict(), SAVE_BEST_PATH)
             print(f"  Saved best model (AUC={best_auc:.4f})")
         else:
@@ -666,7 +671,7 @@ def main():
 
     print(f"\nDone. Best Val AUC: {best_auc:.4f}")
     print(f"Best checkpoint → {SAVE_BEST_PATH}")
-    print(f"Last checkpoint → {SAVE_LAST_PATH} (epoch {epoch})")
+    print(f"Last checkpoint → {SAVE_LAST_PATH}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -675,23 +680,19 @@ def main():
 
 def run_test_only():
     evaluate_test_set(
-        checkpoint      = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_vitb16_best_32_b2_rfdetr.pth",
+        checkpoint      = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_vitb16_last_32_b2_rfdetr.pth",
         test_video_root = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all/test_pure",
         test_roi_root   = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all",
-        max_frames      = 32,
-        img_size        = 224,
-        roi_size        = 224,
-        batch_size      = 2,
-        num_workers     = 4,
-        dropout         = 0.3,
-        results_csv     = "/root/autodl-tmp/suhel/thyroid_nodule/results/test_results_vitb16_ROI_best_32frames_rfdetr.csv",
+        max_frames      = 32, img_size=224, roi_size=224,
+        batch_size      = 2, num_workers=4, dropout=0.3,
+        results_csv     = "/root/autodl-tmp/suhel/thyroid_nodule/results/test_results_vitb16_ROI_last_32frames_rfdetr.csv",
         device_str      = "cuda",
     )
 
 
 if __name__ == "__main__":
     log_path = ("/root/autodl-tmp/suhel/thyroid_nodule/Logs/with_areafiltering/"
-                "dual_vitb16_32frames_rfdetr.txt")
+                "dual_finetuned_vitb16_32frames_rfdetr_last.txt")
     sys.stdout = Tee(log_path)
     try:
         main()
