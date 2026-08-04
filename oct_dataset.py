@@ -85,7 +85,7 @@ class OCTDataset(Dataset):
         }
 
     # -------------------------
-    # Load DICOM — evenly spaced frames
+    # Load DICOM — evenly spaced frames, original spatial dimensions
     # -------------------------
     def load_dcm_volume(self, path):
         dcm = pydicom.dcmread(path)
@@ -96,26 +96,11 @@ class OCTDataset(Dataset):
 
         D = vol.shape[0]
 
-        # ── Depth: evenly spaced index selection (no interpolation) ──────────
-        if D == self.target_depth:
-            pass                                              # nothing to do
-        elif D > self.target_depth:
-            indices = torch.linspace(0, D - 1, self.target_depth).long()
-            vol     = vol[indices]                            # (target_depth, H, W)
-        else:
-            # Fewer frames than target: repeat-pad by cycling through indices
-            indices = torch.linspace(0, D - 1, self.target_depth).long()
-            vol     = vol[indices]                            # still works; linspace wraps
+        # Evenly spaced index selection along depth — no interpolation, no resizing
+        indices = torch.linspace(0, D - 1, self.target_depth).long()
+        vol     = vol[indices]                                # (target_depth, H, W)
 
-        # ── Spatial: bilinear resize of H × W only ───────────────────────────
-        vol = vol.unsqueeze(1)                                # (target_depth, 1, H, W)
-        vol = F.interpolate(
-            vol,
-            size=(self.target_h, self.target_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return vol.squeeze(1)                                 # (target_depth, H, W)
+        return vol
 
     # -------------------------
     # Augmentation
