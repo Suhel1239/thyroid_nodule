@@ -1,17 +1,21 @@
 """
 Thyroid Nodule Video Classification — Dual-Branch (ViT-B/16)
 =============================================================
-Uses timm's ViT-B/16 as the frame encoder.
+Uses timm's ViT-B/16 as the shared frame encoder.
 
 Checkpoint priority (VITB16_FINETUNED_CKPT):
   1. vitb16_mae_pretrained.pth  — MAE domain-adaptive pretraining on thyroid images
   2. vitb16_finetuned_best.pth  — supervised fine-tune on benign/malignant images
-  3. Not set / not found        — falls back to plain ImageNet pretrained weights
+  3. Not set / not found        — plain ImageNet pretrained weights
 
 Pipeline:
   Branch A (whole frame): video frames → ViT-B/16 → TemporalTransformer → (B, 768)
   Branch B (ROI crops)  : pre-saved crops → ViT-B/16 → TemporalTransformer → (B, 768)
   Fusion                : concat → LayerNorm → MLP → Benign/Malignant
+
+NOTE: When loading MAE pretrained weights, the FULL backbone must be trained
+(freeze_backbone=False) because MAE features are reconstruction-oriented and
+not discriminative by default. Freezing leads to class collapse (~64% acc).
 """
 
 import os
@@ -30,21 +34,17 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from einops import rearrange
 from tqdm import tqdm
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
 from PIL import Image
 import timm
+import csv
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
-EMBED_DIM = 768
-
-# Path to pretrained backbone — set via env var or edit directly.
-# Can be MAE pretrained weights (vitb16_mae_pretrained.pth) or
-# supervised finetuned weights (vitb16_finetuned_best.pth).
-# Leave empty / point to missing file to use raw ImageNet weights.
+# Path to pretrained backbone.
+# Set via env var or edit directly.
 VITB16_FINETUNED_CKPT = os.environ.get(
     "VITB16_FINETUNED_CKPT",
     "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/vitb16_mae_pretrained.pth",
@@ -84,22 +84,21 @@ def diagnose(data_root: str, roi_root: str, max_frames: int = 32):
     print("\n" + "=" * 60)
     for split in ("train_pure", "val_pure", "test_pure"):
         for cls in ("benign", "malignant"):
-            vid_dir = data_root / split / cls
+            vid_dir    = data_root / split / cls
             split_name = split.replace("_pure", "")
-            roi_dir = (Path(roi_root)
-                       / f"rois_{max_frames}_rfdetr_topn_withareafiltering"
-                       / split_name / cls)
-
+            roi_dir    = (Path(roi_root)
+                          / f"rois_{max_frames}_rfdetr_topn_withareafiltering"
+                          / split_name / cls)
             if not vid_dir.exists():
                 continue
-            videos  = [v for v in vid_dir.iterdir()
-                       if v.is_file() and v.suffix.lower() in VIDEO_EXTS]
-            rois    = list(roi_dir.glob("*/manifest.json")) if roi_dir.exists() else []
-            total   = len(videos)
-            status  = ("OK" if len(rois) == total
-                       else f"MISMATCH (videos={total}, roi_dirs={len(rois)})")
+            videos = [v for v in vid_dir.iterdir()
+                      if v.is_file() and v.suffix.lower() in VIDEO_EXTS]
+            rois   = list(roi_dir.glob("*/manifest.json")) if roi_dir.exists() else []
+            total  = len(videos)
+            status = ("OK" if len(rois) == total
+                      else f"MISMATCH (videos={total}, roi_dirs={len(rois)})")
             print(f"  [{split}/{cls}]  videos={total}  roi_manifests={len(rois)}  {status}")
-        print("=" * 65 + "\n")
+    print("=" * 60 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -122,7 +121,6 @@ class ThyroidDualDataset(Dataset):
         self.roi_root   = (Path(roi_root)
                            / f"rois_{max_frames}_rfdetr_topn_withareafiltering"
                            / split_name)
-
         self.max_frames = max_frames
         self.roi_size   = roi_size
         self.samples: List[Tuple[Path, Path, int]] = []
@@ -136,30 +134,25 @@ class ThyroidDualDataset(Dataset):
         for class_name, label in self.LABEL_MAP.items():
             cls_vid_dir = existing.get(class_name.lower())
             if cls_vid_dir is None:
-                print(f"  [WARNING] Missing class folder: "
-                      f"{self.video_root / class_name}")
+                print(f"  [WARNING] Missing class folder: {self.video_root / class_name}")
                 continue
-
             cls_roi_dir = self.roi_root / class_name
-
             for vp in sorted(p for p in cls_vid_dir.iterdir()
                              if p.suffix.lower() in VIDEO_EXTS):
                 roi_dir = cls_roi_dir / vp.stem
                 if not (roi_dir / "manifest.json").exists():
-                    print(f"  [WARNING] No ROI manifest for {vp.name} — "
-                          f"run preextract_rois.py first. Skipping.")
+                    print(f"  [WARNING] No ROI manifest for {vp.name} — skipping.")
                     continue
                 self.samples.append((vp, roi_dir, label))
 
-        if len(self.samples) == 0:
+        if not self.samples:
             raise RuntimeError(
-                f"No samples found under {self.video_root}.\n"
+                f"No samples found under {self.video_root}. "
                 f"Run preextract_rois.py to generate ROI crops first.")
 
         b = sum(1 for _, _, l in self.samples if l == 0)
         m = sum(1 for _, _, l in self.samples if l == 1)
-        print(f"  [{self.video_root.name}] benign={b}, malignant={m}, "
-              f"total={len(self.samples)}")
+        print(f"  [{self.video_root.name}] benign={b}, malignant={m}, total={len(self.samples)}")
 
         norm = [transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -169,26 +162,22 @@ class ThyroidDualDataset(Dataset):
                  transforms.ColorJitter(brightness=0.2, contrast=0.2)]
                 if augment else [])
 
-        self.whole_tf = transforms.Compose(
-            aug + [transforms.Resize((img_size, img_size))] + norm)
-        self.roi_tf   = transforms.Compose(
-            aug + [transforms.Resize((roi_size, roi_size))] + norm)
+        self.whole_tf = transforms.Compose(aug + [transforms.Resize((img_size, img_size))] + norm)
+        self.roi_tf   = transforms.Compose(aug + [transforms.Resize((roi_size, roi_size))] + norm)
 
     def __len__(self):
         return len(self.samples)
 
     def _load_whole_frames(self, video_path: Path) -> torch.Tensor:
-        cap   = cv2.VideoCapture(str(video_path))
-        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        cap     = cv2.VideoCapture(str(video_path))
+        total   = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
         indices = np.linspace(0, total - 1, self.max_frames, dtype=int)
-
         frames, last = [], torch.zeros(3, 224, 224)
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
             ret, bgr = cap.read()
             if ret:
-                rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                last = self.whole_tf(Image.fromarray(rgb))
+                last = self.whole_tf(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
             frames.append(last)
         cap.release()
         return torch.stack(frames)
@@ -196,27 +185,21 @@ class ThyroidDualDataset(Dataset):
     def _load_roi_frames(self, roi_dir: Path) -> torch.Tensor:
         with open(roi_dir / "manifest.json") as f:
             manifest = json.load(f)
-
         fnames  = manifest["frames"]
         n_saved = len(fnames)
-
         if n_saved == 0:
             return torch.zeros(self.max_frames, 3, self.roi_size, self.roi_size)
-
-        sample_indices = np.linspace(0, n_saved - 1, self.max_frames, dtype=int)
-
-        frames = []
-        for si in sample_indices:
-            fname    = fnames[int(si)]
-            img_path = roi_dir / fname
+        indices = np.linspace(0, n_saved - 1, self.max_frames, dtype=int)
+        frames  = []
+        for si in indices:
+            img_path = roi_dir / fnames[int(si)]
             if img_path.exists():
                 bgr = cv2.imread(str(img_path))
                 if bgr is not None:
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    frames.append(self.roi_tf(Image.fromarray(rgb)))
+                    frames.append(self.roi_tf(
+                        Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))))
                     continue
             frames.append(torch.zeros(3, self.roi_size, self.roi_size))
-
         return torch.stack(frames)
 
     def __getitem__(self, idx):
@@ -234,28 +217,24 @@ class ViTFrameEncoder(nn.Module):
     """
     Per-frame feature extractor using timm ViT-B/16.
 
-    If a custom checkpoint (MAE pretrained or supervised finetuned) exists,
-    the backbone is initialised WITHOUT ImageNet weights and then the custom
-    weights are loaded — so only your thyroid-adapted weights are used.
-
-    If no checkpoint is found, falls back to plain ImageNet pretrained weights.
+    When a custom checkpoint (MAE / supervised) exists, the backbone is created
+    WITHOUT ImageNet weights and the custom weights are loaded instead.
+    Falls back to ImageNet pretrained if no checkpoint is found.
 
     Input : (B, 3, 224, 224)
-    Output: (B, 768)  — CLS token
+    Output: (B, 768)
     """
 
-    def __init__(self, freeze: bool = True,
-                 finetuned_ckpt: str = VITB16_FINETUNED_CKPT):
+    def __init__(self, finetuned_ckpt: str = VITB16_FINETUNED_CKPT,
+                 freeze: bool = False):
         super().__init__()
 
-        ckpt_exists = finetuned_ckpt and Path(finetuned_ckpt).exists()
+        ckpt_exists = bool(finetuned_ckpt and Path(finetuned_ckpt).exists())
 
-        # Only pull ImageNet weights when no custom checkpoint is available.
-        # This avoids downloading and then immediately overwriting them.
         self.backbone = timm.create_model(
             "vit_base_patch16_224",
-            pretrained=not ckpt_exists,   # ← key fix
-            num_classes=0,                # returns CLS token (B, 768)
+            pretrained=not ckpt_exists,   # skip ImageNet when custom ckpt exists
+            num_classes=0,
         )
         self.hidden_dim = self.backbone.embed_dim  # 768
 
@@ -264,28 +243,31 @@ class ViTFrameEncoder(nn.Module):
             missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
             n_total  = len(self.backbone.state_dict())
             n_loaded = n_total - len(missing)
-            print(f"[ViTFrameEncoder] Loaded custom weights: {finetuned_ckpt}")
+            print(f"[ViTFrameEncoder] Loaded custom weights : {finetuned_ckpt}")
             print(f"  {n_loaded}/{n_total} keys loaded "
                   f"| missing={len(missing)} unexpected={len(unexpected)}")
+            # Sanity check — a well-loaded ViT norm weight hovers near 1.0
+            w_norm = self.backbone.blocks[0].norm1.weight.norm().item()
+            print(f"  block[0].norm1 weight norm = {w_norm:.4f}  "
+                  f"({'OK' if 0.5 < w_norm < 5.0 else 'CHECK KEYS'})")
         else:
-            print(f"[ViTFrameEncoder] Custom checkpoint not found — "
-                  f"using ImageNet pretrained weights.")
-            print(f"  (looked for: {finetuned_ckpt})")
+            print("[ViTFrameEncoder] Custom checkpoint not found — "
+                  "using ImageNet pretrained weights.")
 
         if freeze:
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            print("[ViTFrameEncoder] Backbone frozen.")
+            print("[ViTFrameEncoder] Backbone FROZEN.")
         else:
             n = sum(p.numel() for p in self.backbone.parameters())
-            print(f"[ViTFrameEncoder] Backbone unfrozen ({n:,} params).")
+            print(f"[ViTFrameEncoder] Backbone TRAINABLE ({n:,} params).")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)  # (B, 768)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 3. Temporal Transformer  (one instance per branch)
+# 3. Temporal Transformer
 # ─────────────────────────────────────────────────────────────────────
 
 class TemporalTransformer(nn.Module):
@@ -295,23 +277,20 @@ class TemporalTransformer(nn.Module):
         super().__init__()
         self.pos_embedding = nn.Parameter(
             torch.randn(1, max_frames + 1, embed_dim) * 0.02)
-        self.cls_token = nn.Parameter(
-            torch.randn(1, 1, embed_dim) * 0.02)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
-            dropout=dropout, activation="gelu",
-            batch_first=True, norm_first=True,
-        )
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.norm        = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):                          # (B, T, D)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, T, D)
         B, T, _ = x.shape
         cls = self.cls_token.expand(B, -1, -1)
-        x   = torch.cat([cls, x], dim=1)           # (B, T+1, D)
+        x   = torch.cat([cls, x], dim=1)
         x   = x + self.pos_embedding[:, :T + 1]
         x   = self.transformer(x)
-        return self.norm(x[:, 0])                  # (B, D)
+        return self.norm(x[:, 0])  # (B, D)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -320,36 +299,34 @@ class TemporalTransformer(nn.Module):
 
 class DualBranchThyroidClassifier(nn.Module):
     """
-    Branch A : whole video frames  → ViT-B/16 → TemporalTransformer → (B, D)
-    Branch B : ROI crops           → ViT-B/16 → TemporalTransformer → (B, D)
-    Fusion   : concat(A,B) → LayerNorm → Linear(512) → GELU → Dropout → Linear(2)
-
-    The ViT encoder is shared between both branches.
+    Branch A : whole frames → shared ViT → TemporalTransformer_A → (B, D)
+    Branch B : ROI crops   → shared ViT → TemporalTransformer_B → (B, D)
+    Fusion   : concat(A, B) → LayerNorm → Linear(512) → GELU → Dropout → Linear(2)
     """
+
     def __init__(self,
                  num_classes:     int   = 2,
                  max_frames:      int   = 32,
-                 freeze_backbone: bool  = True,
+                 freeze_backbone: bool  = False,
                  temporal_heads:  int   = 8,
                  temporal_layers: int   = 2,
                  dropout:         float = 0.3):
         super().__init__()
 
         self.frame_encoder = ViTFrameEncoder(freeze=freeze_backbone)
-        embed_dim = self.frame_encoder.hidden_dim  # 768
+        D = self.frame_encoder.hidden_dim  # 768
 
         self.whole_temporal = TemporalTransformer(
-            embed_dim=embed_dim, num_heads=temporal_heads,
+            embed_dim=D, num_heads=temporal_heads,
             num_layers=temporal_layers, max_frames=max_frames, dropout=dropout)
 
         self.roi_temporal = TemporalTransformer(
-            embed_dim=embed_dim, num_heads=temporal_heads,
+            embed_dim=D, num_heads=temporal_heads,
             num_layers=temporal_layers, max_frames=max_frames, dropout=dropout)
 
-        fused_dim = embed_dim * 2
         self.fusion = nn.Sequential(
-            nn.LayerNorm(fused_dim),
-            nn.Linear(fused_dim, 512),
+            nn.LayerNorm(D * 2),
+            nn.Linear(D * 2, 512),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(512, num_classes),
@@ -359,16 +336,14 @@ class DualBranchThyroidClassifier(nn.Module):
                 temporal: TemporalTransformer) -> torch.Tensor:
         B, T, C, H, W = videos.shape
         frames = rearrange(videos, 'b t c h w -> (b t) c h w')
-        feats  = self.frame_encoder(frames)               # (B*T, D)
+        feats  = self.frame_encoder(frames)                    # (B*T, D)
         feats  = rearrange(feats, '(b t) d -> b t d', b=B, t=T)
-        return temporal(feats)                            # (B, D)
+        return temporal(feats)                                 # (B, D)
 
-    def forward(self, whole: torch.Tensor,
-                      roi:   torch.Tensor) -> torch.Tensor:
+    def forward(self, whole: torch.Tensor, roi: torch.Tensor) -> torch.Tensor:
         whole_feat = self._encode(whole, self.whole_temporal)
         roi_feat   = self._encode(roi,   self.roi_temporal)
-        fused      = torch.cat([whole_feat, roi_feat], dim=-1)
-        return self.fusion(fused)
+        return self.fusion(torch.cat([whole_feat, roi_feat], dim=-1))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -427,74 +402,58 @@ def evaluate(model, loader, criterion, device):
     report = classification_report(all_labels, preds,
                  target_names=["Benign", "Malignant"],
                  output_dict=True, zero_division=0)
-    return {"loss": total / len(loader),
-            "accuracy": report["accuracy"], "auc": auc}
+    return {"loss": total / len(loader), "accuracy": report["accuracy"], "auc": auc}
 
 
-from sklearn.metrics import confusion_matrix
-import csv
+# ─────────────────────────────────────────────────────────────────────
+# 7. Test-set evaluation
+# ─────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def evaluate_test_set(
-        checkpoint: str,
+        checkpoint:      str,
         test_video_root: str,
-        test_roi_root: str,
-        max_frames: int = 32,
-        img_size: int = 224,
-        roi_size: int = 224,
-        batch_size: int = 1,
-        num_workers: int = 4,
-        dropout: float = 0.3,
-        results_csv: str = "/root/autodl-tmp/suhel/thyroid_nodule/results/test_results_vitb16_ROI_best_32frames_rfdetr.csv",
-        device_str: str = "cuda",
+        test_roi_root:   str,
+        max_frames:      int   = 32,
+        img_size:        int   = 224,
+        roi_size:        int   = 224,
+        batch_size:      int   = 1,
+        num_workers:     int   = 4,
+        dropout:         float = 0.3,
+        results_csv:     str   = "/root/autodl-tmp/suhel/thyroid_nodule/results/"
+                                 "test_results_vitb16_ROI_best_32frames_rfdetr.csv",
+        device_str:      str   = "cuda",
 ):
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     print(f"\n{'=' * 60}")
-    print(f"  Test-set evaluation")
-    print(f"  Checkpoint : {checkpoint}")
-    print(f"  Test root  : {test_video_root}")
-    print(f"  Device     : {device}")
+    print(f"  Test-set evaluation  |  checkpoint: {checkpoint}")
     print(f"{'=' * 60}\n")
 
     model = DualBranchThyroidClassifier(
-        max_frames=max_frames,
-        freeze_backbone=True,
-        dropout=dropout,
-    ).to(device)
-    state = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(state)
+        max_frames=max_frames, freeze_backbone=False, dropout=dropout).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
     model.eval()
     print("Model loaded.\n")
 
     test_ds = ThyroidDualDataset(
-        video_root=test_video_root,
-        roi_root=test_roi_root,
-        max_frames=max_frames,
-        img_size=img_size,
-        roi_size=roi_size,
-        augment=False,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        collate_fn=collate_fn)
+        video_root=test_video_root, roi_root=test_roi_root,
+        max_frames=max_frames, img_size=img_size, roi_size=roi_size, augment=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=True,
+                             collate_fn=collate_fn)
 
     all_preds, all_probs, all_labels = [], [], []
     all_video_names = [s[0].name for s in test_ds.samples]
 
     for whole, roi, lbls in tqdm(test_loader, desc="Testing"):
-        whole  = whole.to(device)
-        roi    = roi.to(device)
-        lbls   = lbls.to(device)
-        logits = model(whole, roi)
-        p      = F.softmax(logits, dim=-1)
+        whole, roi, lbls = whole.to(device), roi.to(device), lbls.to(device)
+        p = F.softmax(model(whole, roi), dim=-1)
         all_preds.extend(p.argmax(1).cpu().numpy().tolist())
         all_probs.extend(p[:, 1].cpu().numpy().tolist())
         all_labels.extend(lbls.cpu().numpy().tolist())
 
     print("\n" + "─" * 50)
-    print("Classification Report (default threshold 0.5):")
-    print("─" * 50)
+    print("Classification Report (threshold 0.5):")
     print(classification_report(all_labels, all_preds,
           target_names=["Benign", "Malignant"], zero_division=0))
 
@@ -503,55 +462,39 @@ def evaluate_test_set(
 
     from sklearn.metrics import roc_curve
     fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
-    J        = tpr - fpr
-    best_thr = float(thresholds[np.argmax(J)])
-    print(f"\nOptimal threshold (Youden J): {best_thr:.4f}")
-
+    best_thr = float(thresholds[np.argmax(tpr - fpr)])
+    print(f"Optimal threshold (Youden J): {best_thr:.4f}")
     preds_tuned = (np.array(all_probs) >= best_thr).astype(int).tolist()
     print("\nWith tuned threshold:")
     print(classification_report(all_labels, preds_tuned,
           target_names=["Benign", "Malignant"], zero_division=0))
 
     cm = confusion_matrix(all_labels, all_preds)
-    print(f"\nConfusion Matrix (rows=GT, cols=Pred):")
-    print(f"              Pred Benign  Pred Malignant")
-    print(f"  GT Benign       {cm[0, 0]:>5}          {cm[0, 1]:>5}")
-    print(f"  GT Malignant    {cm[1, 0]:>5}          {cm[1, 1]:>5}")
-
-    sensitivity = cm[1,1]/(cm[1,1]+cm[1,0]) if (cm[1,1]+cm[1,0]) > 0 else 0.0
-    specificity = cm[0,0]/(cm[0,0]+cm[0,1]) if (cm[0,0]+cm[0,1]) > 0 else 0.0
-    print(f"\nSensitivity (malignant recall) : {sensitivity:.4f}")
-    print(f"Specificity (benign recall)    : {specificity:.4f}")
+    sensitivity = cm[1,1] / (cm[1,1] + cm[1,0]) if (cm[1,1] + cm[1,0]) > 0 else 0.0
+    specificity = cm[0,0] / (cm[0,0] + cm[0,1]) if (cm[0,0] + cm[0,1]) > 0 else 0.0
+    print(f"Sensitivity: {sensitivity:.4f}  Specificity: {specificity:.4f}")
     print("─" * 50)
 
     id2name = {0: "Benign", 1: "Malignant"}
-    rows = []
-    for vname, gt, pred, mal_prob in zip(
-            all_video_names, all_labels, all_preds, all_probs):
-        rows.append({
-            "video_name":     vname,
-            "gt_label":       id2name.get(int(gt), str(gt)),
-            "pred_label":     id2name.get(int(pred), str(pred)),
-            "benign_prob":    round(1.0 - float(mal_prob), 4),
-            "malignant_prob": round(float(mal_prob), 4),
-            "correct":        "yes" if int(gt) == int(pred) else "no",
-        })
+    rows = [{"video_name": vn, "gt_label": id2name[int(gt)],
+             "pred_label": id2name[int(pr)],
+             "benign_prob": round(1.0 - float(mp), 4),
+             "malignant_prob": round(float(mp), 4),
+             "correct": "yes" if int(gt) == int(pr) else "no"}
+            for vn, gt, pr, mp in zip(
+                all_video_names, all_labels, all_preds, all_probs)]
 
     os.makedirs(os.path.dirname(os.path.abspath(results_csv)), exist_ok=True)
     with open(results_csv, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["video_name", "gt_label", "pred_label",
-                           "benign_prob", "malignant_prob", "correct"])
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-
-    print(f"\nPer-video results saved → {results_csv}")
-    return {"auc": auc, "sensitivity": sensitivity,
-            "specificity": specificity, "predictions": rows}
+    print(f"\nResults saved → {results_csv}")
+    return {"auc": auc, "sensitivity": sensitivity, "specificity": specificity}
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 7. Main
+# 8. Main
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -565,23 +508,22 @@ def main():
     IMG_SIZE            = 224
     ROI_SIZE            = 224
     EPOCHS              = 50
-    LR                  = 1e-4
-    BACKBONE_LR         = 5e-6
+    LR                  = 1e-4    # temporal + fusion LR
+    BACKBONE_LR         = 1e-5    # full backbone LR (higher than before — MAE needs it)
     WEIGHT_DECAY        = 1e-4
     DROPOUT             = 0.3
-    WARMUP_EPOCHS       = 3
+    WARMUP_EPOCHS       = 5       # longer warmup to protect the backbone early on
     EARLY_STOP_PATIENCE = 10
     NUM_WORKERS         = 4
 
     diagnose(DATA_ROOT, ROI_ROOT, MAX_FRAMES)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}\n")
+    print(f"Device: {device}\n")
 
     train_ds = ThyroidDualDataset(
         video_root=os.path.join(DATA_ROOT, "train_pure"), roi_root=ROI_ROOT,
         max_frames=MAX_FRAMES, img_size=IMG_SIZE, roi_size=ROI_SIZE, augment=True)
-
     val_ds = ThyroidDualDataset(
         video_root=os.path.join(DATA_ROOT, "val_pure"), roi_root=ROI_ROOT,
         max_frames=MAX_FRAMES, img_size=IMG_SIZE, roi_size=ROI_SIZE, augment=False)
@@ -593,31 +535,19 @@ def main():
                               num_workers=NUM_WORKERS, pin_memory=True,
                               collate_fn=collate_fn)
 
+    # freeze_backbone=False — full backbone must train when starting from MAE weights
     model = DualBranchThyroidClassifier(
-        max_frames=MAX_FRAMES,
-        freeze_backbone=True,
-        dropout=DROPOUT,
-    ).to(device)
+        max_frames=MAX_FRAMES, freeze_backbone=False, dropout=DROPOUT).to(device)
 
     counts    = np.bincount([lbl for _, _, lbl in train_ds.samples])
-    weights   = torch.tensor(1.0 / counts.astype(float),
-                             dtype=torch.float32).to(device)
+    weights   = torch.tensor(1.0 / counts.astype(float), dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    # Unfreeze last 2 transformer blocks + norm for fine-tuning
-    for blk in model.frame_encoder.backbone.blocks[-2:]:
-        for p in blk.parameters():
-            p.requires_grad = True
-    for p in model.frame_encoder.backbone.norm.parameters():
-        p.requires_grad = True
-    for name, p in model.named_parameters():
-        if any(k in name for k in ("temporal", "fusion", "classifier")):
-            p.requires_grad = True
-
-    backbone_params = [p for n, p in model.named_parameters()
-                       if p.requires_grad and "frame_encoder.backbone" in n]
-    head_params     = [p for n, p in model.named_parameters()
-                       if p.requires_grad and "frame_encoder.backbone" not in n]
+    # Separate backbone params from head/temporal params for differential LR
+    backbone_params = list(model.frame_encoder.backbone.parameters())
+    head_params     = (list(model.whole_temporal.parameters()) +
+                       list(model.roi_temporal.parameters()) +
+                       list(model.fusion.parameters()))
 
     optimizer = torch.optim.AdamW([
         {"params": head_params,     "lr": LR,          "weight_decay": WEIGHT_DECAY},
@@ -633,9 +563,11 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {n_params:,}  "
-          f"(head @ lr={LR}, backbone_last2 @ lr={BACKBONE_LR})\n")
+    n_total    = sum(p.numel() for p in model.parameters())
+    n_backbone = sum(p.numel() for p in backbone_params)
+    n_head     = sum(p.numel() for p in head_params)
+    print(f"Params — backbone: {n_backbone:,} @ lr={BACKBONE_LR}  "
+          f"head/temporal: {n_head:,} @ lr={LR}  total: {n_total:,}\n")
 
     os.makedirs(os.path.dirname(SAVE_BEST_PATH), exist_ok=True)
 
@@ -662,20 +594,19 @@ def main():
             print(f"  Saved best model (AUC={best_auc:.4f})")
         else:
             no_improve += 1
-            print(f"  No improvement in val AUC for {no_improve}/"
-                  f"{EARLY_STOP_PATIENCE} epoch(s)")
+            print(f"  No improvement for {no_improve}/{EARLY_STOP_PATIENCE} epoch(s)")
 
         if no_improve >= EARLY_STOP_PATIENCE:
-            print(f"\nEarly stopping triggered at epoch {epoch}.")
+            print(f"\nEarly stopping at epoch {epoch}.")
             break
 
     print(f"\nDone. Best Val AUC: {best_auc:.4f}")
-    print(f"Best checkpoint → {SAVE_BEST_PATH}")
-    print(f"Last checkpoint → {SAVE_LAST_PATH}")
+    print(f"Best → {SAVE_BEST_PATH}")
+    print(f"Last → {SAVE_LAST_PATH}")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 8. Test-only
+# 9. Test-only entry point
 # ─────────────────────────────────────────────────────────────────────
 
 def run_test_only():
@@ -683,10 +614,10 @@ def run_test_only():
         checkpoint      = "/root/autodl-tmp/suhel/thyroid_nodule/weights_videos/dual_finetuned_vitb16_last_32_b2_rfdetr.pth",
         test_video_root = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all/test_pure",
         test_roi_root   = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all",
-        max_frames      = 32, img_size=224, roi_size=224,
-        batch_size      = 2, num_workers=4, dropout=0.3,
-        results_csv     = "/root/autodl-tmp/suhel/thyroid_nodule/results/test_results_vitb16_ROI_last_32frames_rfdetr.csv",
-        device_str      = "cuda",
+        max_frames=32, img_size=224, roi_size=224,
+        batch_size=2, num_workers=4, dropout=0.3,
+        results_csv="/root/autodl-tmp/suhel/thyroid_nodule/results/"
+                    "test_results_vitb16_ROI_last_32frames_rfdetr.csv",
     )
 
 
