@@ -284,10 +284,21 @@ class ViTFrameEncoder(nn.Module):
         if freeze:
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            print("[ViTFrameEncoder] Backbone FROZEN.")
+            print("[ViTFrameEncoder] Backbone FULLY FROZEN.")
         else:
-            n = sum(p.numel() for p in self.backbone.parameters())
-            print(f"[ViTFrameEncoder] Backbone TRAINABLE ({n:,} params).")
+            # Freeze blocks 0–7; only train blocks 8–11 + final norm
+            TRAINABLE_BLOCKS = {8, 9, 10, 11}
+            for name, p in self.backbone.named_parameters():
+                trainable = (
+                    any(f"blocks.{i}." in name for i in TRAINABLE_BLOCKS)
+                    or name.startswith("norm.")
+                )
+                p.requires_grad = trainable
+            n_trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+            n_frozen    = sum(p.numel() for p in self.backbone.parameters() if not p.requires_grad)
+            print(f"[ViTFrameEncoder] Backbone PARTIAL FREEZE — "
+                  f"trainable={n_trainable:,}  frozen={n_frozen:,}  "
+                  f"(blocks 8-11 + norm trainable, blocks 0-7 frozen)")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)  # (B, 768)
