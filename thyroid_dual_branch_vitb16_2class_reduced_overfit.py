@@ -581,7 +581,7 @@ def evaluate_test_set(
                    if len(set(sub_gt)) > 1 else float("nan"))
         print(f"\n[{kind.upper()} sources — {len(idx)} samples]")
         print(classification_report(sub_gt, sub_pd,
-              target_names=CLASS_NAMES, zero_division=0))
+              labels=[0, 1], target_names=CLASS_NAMES, zero_division=0))
         print(f"  AUC: {sub_auc:.4f}")
 
     print("─" * 55)
