@@ -14,7 +14,6 @@ Usage:
   python frame_browser.py --root /path/to/root --output /path/to/saved_frames
 """
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -25,6 +24,11 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
 DELAY_MS   = 60    # ~16 fps default; increase to slow down
+
+# ── Configure these paths ─────────────────────────────────────────────
+ROOT_DIR   = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
+OUTPUT_DIR = "/root/autodl-tmp/suhel/thyroid_nodule/saved_best_frames"
+# ─────────────────────────────────────────────────────────────────────
 
 
 # ── Source discovery ──────────────────────────────────────────────────
@@ -203,23 +207,9 @@ def browse(sources: list, output_dir: Path, delay_ms: int):
     print("\nDone.")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Interactive frame browser.")
-    p.add_argument("--root",   required=True,  type=Path,
-                   help="Root folder containing video files or cine folders")
-    p.add_argument("--output", required=True,  type=Path,
-                   help="Directory where saved frames (JPG) are written")
-    p.add_argument("--delay",  default=DELAY_MS, type=int,
-                   help=f"Milliseconds per frame while playing (default {DELAY_MS})")
-    return p.parse_args()
-
-
 def main():
-    args    = parse_args()
-    root    = args.root.resolve()
-    output  = args.output.resolve()
+    root   = Path(ROOT_DIR).resolve()
+    output = Path(OUTPUT_DIR).resolve()
 
     if not root.exists():
         sys.exit(f"Root does not exist: {root}")
@@ -231,7 +221,7 @@ def main():
           f"{sum(1 for k,_,_ in sources if k=='cine')} cine folders)")
     print(f"Saving frames to: {output}\n")
 
-    browse(sources, output, args.delay)
+    browse(sources, output, DELAY_MS)
 
 
 if __name__ == "__main__":
