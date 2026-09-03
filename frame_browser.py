@@ -33,31 +33,33 @@ OUTPUT_DIR = "/root/autodl-tmp/suhel/thyroid_nodule/saved_best_frames"
 
 # ── Source discovery ──────────────────────────────────────────────────
 
-def discover_sources(root: Path) -> list[tuple[str, Path, str]]:
+def discover_sources(root: Path) -> list[tuple[str, Path, str, Path]]:
     """
-    Walk root (one level of subfolders allowed).
-    Returns list of (kind, path, stem):
-      kind = "video"  → path is a video file,  stem = filename without ext
-      kind = "cine"   → path is an image dir,   stem = folder name
+    Walk root recursively (unlimited depth).
+    Returns list of (kind, path, stem, rel_parent):
+      kind       = "video" or "cine"
+      path       = absolute path to video file or cine folder
+      stem       = video filename without ext, or cine folder name
+      rel_parent = relative path from root to the parent folder
+                   (used to mirror folder structure in output)
     """
     sources = []
 
     def _scan_dir(d: Path):
+        rel_parent = d.relative_to(root)
         entries = sorted(d.iterdir())
         for e in entries:
             if e.is_file() and e.suffix.lower() in VIDEO_EXTS:
-                sources.append(("video", e, e.stem))
+                sources.append(("video", e, e.stem, rel_parent))
             elif e.is_dir():
                 imgs = [f for f in e.iterdir()
                         if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
                 if imgs:
-                    sources.append(("cine", e, e.name))
+                    sources.append(("cine", e, e.name, rel_parent))
+                else:
+                    _scan_dir(e)   # recurse into subfolders without images
 
     _scan_dir(root)
-    # also check one level of subfolders
-    for sub in sorted(root.iterdir()):
-        if sub.is_dir():
-            _scan_dir(sub)
 
     # deduplicate while preserving order
     seen = set()
@@ -145,7 +147,7 @@ def browse(sources: list, output_dir: Path, delay_ms: int):
     while True:
         # ── load source ───────────────────────────────────────────────
         if needs_load:
-            kind, path, stem = sources[src_idx]
+            kind, path, stem, rel_parent = sources[src_idx]
             print(f"\n[{src_idx + 1}/{len(sources)}] Loading {kind}: {path.name}")
             if kind == "video":
                 frames = load_video_frames(path)
@@ -174,7 +176,9 @@ def browse(sources: list, output_dir: Path, delay_ms: int):
             break
 
         elif key == ord('s'):               # S → save current frame
-            out_path = output_dir / f"{stem}.jpg"
+            save_subdir = output_dir / rel_parent
+            save_subdir.mkdir(parents=True, exist_ok=True)
+            out_path = save_subdir / f"{stem}.jpg"
             cv2.imwrite(str(out_path), frames[frame_idx])
             saved = True
             print(f"  Saved → {out_path}")
@@ -217,8 +221,8 @@ def main():
     print(f"Scanning: {root}")
     sources = discover_sources(root)
     print(f"Found {len(sources)} sources "
-          f"({sum(1 for k,_,_ in sources if k=='video')} videos, "
-          f"{sum(1 for k,_,_ in sources if k=='cine')} cine folders)")
+          f"({sum(1 for k,*_ in sources if k=='video')} videos, "
+          f"{sum(1 for k,*_ in sources if k=='cine')} cine folders)")
     print(f"Saving frames to: {output}\n")
 
     browse(sources, output, DELAY_MS)
