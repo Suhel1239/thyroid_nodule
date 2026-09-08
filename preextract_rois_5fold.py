@@ -362,7 +362,6 @@ def run(
     print(f"  fallback tier 2  : no detection (full-frame resize)")
     print(f"  area_filter_mode : {area_filter_mode.upper()}\n")
 
-    out_tag = f"rois_{n_save}_5fold"
 
     # ── Extract ROIs for every fold ──────────────────────────────────
     for k, fold in enumerate(fold_splits):
@@ -383,8 +382,7 @@ def run(
 
                 for source_path, kind, stem in tqdm(
                         sources, desc=f"fold{k}/{split_name}/{cls}"):
-                    save_dir = (output_root / out_tag
-                                / f"fold_{k}" / split_name / cls / stem)
+                    save_dir = output_root / f"fold_{k}" / split_name / cls / stem
                     _process_source(
                         source_path      = source_path,
                         kind             = kind,
@@ -399,7 +397,7 @@ def run(
                     )
 
     print("\n✅ 5-fold pre-extraction complete.")
-    print(f"   Output: {output_root / out_tag}/")
+    print(f"   Output: {output_root}/")
     print(f"   Structure: fold_{{0-4}}/{{train|val|test}}/{{cls}}/{{stem}}/")
 
 
