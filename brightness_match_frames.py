@@ -61,12 +61,22 @@ def _median_luminance_folder(image_files: list, n_samples: int) -> float:
     return float(np.median(lums)) if lums else 128.0
 
 
-def _apply_brightness_offset(bgr: np.ndarray, offset: float) -> np.ndarray:
-    """Add a constant offset to V channel, clip to [0,255].
-    Additive shift lifts dark and bright pixels equally — no amplification."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] + offset, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+def _build_gamma_lut(gamma: float) -> np.ndarray:
+    """Pre-compute uint8 lookup table for gamma correction."""
+    table = np.array([
+        min(255, int(255.0 * (i / 255.0) ** gamma + 0.5))
+        for i in range(256)
+    ], dtype=np.uint8)
+    return table
+
+
+def _apply_gamma(bgr: np.ndarray, gamma: float) -> np.ndarray:
+    """Apply gamma to V channel via LUT.
+    gamma < 1 → brightens; blacks stay black, contrast preserved."""
+    lut = _build_gamma_lut(gamma)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hsv[:, :, 2] = lut[hsv[:, :, 2]]
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
 def process(root: Path, output_root: Path, ref_video: Path):
@@ -95,15 +105,19 @@ def process(root: Path, output_root: Path, ref_video: Path):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         src_lum = _median_luminance_folder(image_files, SRC_SAMPLE_FRAMES)
-        offset  = target_lum - src_lum
+        # gamma = log(target/255) / log(src/255); gamma<1 brightens without lifting blacks
+        eps   = 1e-6
+        gamma = (np.log(target_lum / 255.0 + eps) /
+                 np.log(src_lum    / 255.0 + eps))
+        gamma = float(np.clip(gamma, 0.2, 5.0))
 
-        print(f"{rel}  src_lum={src_lum:.2f}  offset={offset:+.2f}  ({len(image_files)} frames)")
+        print(f"{rel}  src_lum={src_lum:.2f}  gamma={gamma:.3f}  ({len(image_files)} frames)")
 
         for img_path in tqdm(image_files, desc=str(rel), leave=False):
             bgr = cv2.imread(str(img_path))
             if bgr is None:
                 continue
-            out_bgr = _apply_brightness_offset(bgr, offset)
+            out_bgr = _apply_gamma(bgr, gamma)
             cv2.imwrite(str(out_dir / img_path.name), out_bgr)
 
     print("\nDone.")
