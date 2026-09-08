@@ -38,10 +38,10 @@ from tqdm import tqdm
 DATA_ROOT   = "/root/autodl-tmp/suhel/thyroid_nodule/data"
 OUTPUT_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/data_5fold"
 
-CLASS_MAP = {          # subfolder in DATA_ROOT  →  label in output
-    "b": "benign",
-    "n": "indeterminate",
-    "m": "malignant",
+CLASS_MAP = {               # subfolder in DATA_ROOT  →  label in output
+    "benign":        "benign",
+    "malignant":     "malignant",
+    "intermediate":  "intermediate",
 }
 
 N_FOLDS     = 5
@@ -169,7 +169,7 @@ def main():
     print(f"Output structure:")
     print(f"  {output_root}/")
     print(f"    fold_0/train/benign/   fold_0/val/benign/   fold_0/test/benign/")
-    print(f"    fold_0/train/indeterminate/  ...")
+    print(f"    fold_0/train/intermediate/  ...")
     print(f"    fold_1/  fold_2/  fold_3/  fold_4/")
 
 
