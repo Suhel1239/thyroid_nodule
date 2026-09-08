@@ -313,9 +313,20 @@ def run(
 
     # ── Pool all sources ─────────────────────────────────────────────
     print(f"Collecting sources from: {data_root}")
+    if not data_root.exists():
+        raise SystemExit(f"\n[ERROR] DATA_ROOT does not exist: {data_root}\nEdit DATA_ROOT in the CONFIG block.")
     for folder, label in class_map.items():
-        print(f"  {folder}/ → label '{label}'")
+        cls_dir = data_root / folder
+        exists  = "OK" if cls_dir.exists() else "MISSING"
+        print(f"  {folder}/ → label '{label}'  [{exists}]")
     per_class = collect_all_sources(data_root, class_map)
+    total_sources = sum(len(v) for v in per_class.values())
+    if total_sources == 0:
+        raise SystemExit(
+            f"\n[ERROR] No sources found under {data_root}\n"
+            f"Check that DATA_ROOT contains subfolders: {list(class_map.keys())}\n"
+            f"Each subfolder should hold video files or cine image folders."
+        )
     for cls, srcs in per_class.items():
         n_vid  = sum(1 for _, k, _ in srcs if k == "video")
         n_cine = sum(1 for _, k, _ in srcs if k == "cine")
