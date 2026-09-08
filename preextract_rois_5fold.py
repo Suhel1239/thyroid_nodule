@@ -33,9 +33,22 @@ from rfdetr import RFDETRMedium
 from tqdm import tqdm
 
 # ── CONFIG ────────────────────────────────────────────────────────────
-DATA_ROOT         = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
+# DATA_ROOT must contain one subfolder per class, each holding videos/cine folders.
+# Example:
+#   DATA_ROOT/b/   ← benign
+#   DATA_ROOT/n/   ← indeterminate
+#   DATA_ROOT/m/   ← malignant
+#
+# CLASS_MAP maps subfolder name → output label used in the saved directory tree.
+DATA_ROOT         = "/root/autodl-tmp/suhel/thyroid_nodule/data"
 RFDETR_CHECKPOINT = "/root/autodl-tmp/suhel/thyroid_nodule/RFDETR_for_ROI/single/checkpoint_best_regular.pth"
 OUTPUT_ROOT       = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
+
+CLASS_MAP = {          # subfolder_name : label used in output paths
+    "b": "benign",
+    "n": "indeterminate",
+    "m": "malignant",
+}
 
 MAX_FRAMES        = 16      # frames sampled per source
 N_SAVE            = 16      # frames to keep per source
@@ -53,37 +66,29 @@ VIDEO_EXTS       = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTS       = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 MODEL_DETECT_THR = 0.25   # low threshold to capture tier-1 fallback detections
 
-EXISTING_SPLITS  = ("train_3_class", "val_3_class", "test_3_class",
-                    "train", "val", "test")   # extend if needed
-
 
 # ── Source discovery ──────────────────────────────────────────────────
 
-def collect_all_sources(data_root: Path, classes: list[str]) -> dict[str, list]:
+def collect_all_sources(data_root: Path, class_map: dict) -> dict[str, list]:
     """
-    Pool every video file and cine folder across all existing splits for
-    each class. Returns {cls: [(path, kind, stem), ...]}.
+    Read directly from data_root/<folder>/ for each entry in class_map.
+    Returns {label: [(path, kind, stem), ...]}.
     """
-    per_class = {cls: [] for cls in classes}
-    seen      = {cls: set() for cls in classes}   # dedup by stem
+    per_class = {label: [] for label in class_map.values()}
 
-    for split in EXISTING_SPLITS:
-        for cls in classes:
-            cls_dir = data_root / split / cls
-            if not cls_dir.exists():
-                continue
-            for entry in sorted(cls_dir.iterdir()):
-                if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
-                    key = entry.stem
-                    if key not in seen[cls]:
-                        seen[cls].add(key)
-                        per_class[cls].append((entry, "video", entry.stem))
-                elif entry.is_dir():
-                    has_imgs = any(f.suffix.lower() in IMAGE_EXTS
-                                   for f in entry.iterdir() if f.is_file())
-                    if has_imgs and entry.name not in seen[cls]:
-                        seen[cls].add(entry.name)
-                        per_class[cls].append((entry, "cine", entry.name))
+    for folder, label in class_map.items():
+        cls_dir = data_root / folder
+        if not cls_dir.exists():
+            print(f"  [WARNING] folder not found: {cls_dir}")
+            continue
+        for entry in sorted(cls_dir.iterdir()):
+            if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+                per_class[label].append((entry, "video", entry.stem))
+            elif entry.is_dir():
+                has_imgs = any(f.suffix.lower() in IMAGE_EXTS
+                               for f in entry.iterdir() if f.is_file())
+                if has_imgs:
+                    per_class[label].append((entry, "cine", entry.name))
 
     return per_class
 
@@ -296,19 +301,21 @@ def run(
     area_filter_mode:  str  = AREA_FILTER_MODE,
     n_folds:           int  = N_FOLDS,
     seed:              int  = RANDOM_SEED,
-    classes:           list = None,
+    class_map:         dict = None,
 ):
     assert n_save <= max_frames
 
-    if classes is None:
-        classes = ["benign", "malignant", "indeterminate"]
+    if class_map is None:
+        class_map = CLASS_MAP
 
     data_root   = Path(data_root)
     output_root = Path(output_root)
 
     # ── Pool all sources ─────────────────────────────────────────────
-    print("Collecting sources from all existing splits...")
-    per_class = collect_all_sources(data_root, classes)
+    print(f"Collecting sources from: {data_root}")
+    for folder, label in class_map.items():
+        print(f"  {folder}/ → label '{label}'")
+    per_class = collect_all_sources(data_root, class_map)
     for cls, srcs in per_class.items():
         n_vid  = sum(1 for _, k, _ in srcs if k == "video")
         n_cine = sum(1 for _, k, _ in srcs if k == "cine")
@@ -316,11 +323,12 @@ def run(
 
     # ── Build 5-fold splits ──────────────────────────────────────────
     fold_splits = make_5fold_splits(per_class, n_folds=n_folds, seed=seed)
+    labels = list(class_map.values())
 
     print(f"\nFold sizes (train / val / test) per fold:")
     for k, fold in enumerate(fold_splits):
         parts = []
-        for cls in classes:
+        for cls in labels:
             tr = len(fold[cls]["train"])
             va = len(fold[cls]["val"])
             te = len(fold[cls]["test"])
@@ -363,7 +371,7 @@ def run(
         print(f"{'='*60}")
 
         for split_name in ("train", "val", "test"):
-            for cls in classes:
+            for cls in labels:
                 sources = fold[cls][split_name]
                 if not sources:
                     continue
