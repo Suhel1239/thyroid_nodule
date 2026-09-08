@@ -35,13 +35,13 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ── CONFIG ────────────────────────────────────────────────────────────
-DATA_ROOT   = "/root/autodl-tmp/suhel/thyroid_nodule/data"
+DATA_ROOT   = "/root/autodl-tmp/suhel/thyroid_nodule"
 OUTPUT_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/data_5fold"
 
-CLASS_MAP = {                  # subfolder in DATA_ROOT  →  label in output
-    "benign":        "benign",
-    "malignant":     "malignant",
-    "indeterminate": "indeterminate",
+CLASS_MAP = {               # subfolder in DATA_ROOT  →  label in output
+    "benign":               "benign",
+    "enhanced_malignant":   "malignant",
+    "indeterminate":        "indeterminate",
 }
 
 N_FOLDS     = 5
@@ -61,6 +61,9 @@ def collect_sources(data_root: Path, class_map: dict) -> dict[str, list]:
             print(f"  [WARNING] not found: {cls_dir}")
             continue
         for entry in sorted(cls_dir.iterdir()):
+            if "traverse" in entry.name.lower():
+                print(f"  [skip] traverse in name: {entry.name}")
+                continue
             if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
                 per_class[label].append((entry, "video", entry.name))
             elif entry.is_dir():
