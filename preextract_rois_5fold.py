@@ -40,14 +40,16 @@ from tqdm import tqdm
 #   DATA_ROOT/m/   ← malignant
 #
 # CLASS_MAP maps subfolder name → output label used in the saved directory tree.
+# DATA_ROOT: parent folder containing benign/, malignant/, indeterminate/
 DATA_ROOT         = "/root/autodl-tmp/suhel/thyroid_nodule/data"
 RFDETR_CHECKPOINT = "/root/autodl-tmp/suhel/thyroid_nodule/RFDETR_for_ROI/single/checkpoint_best_regular.pth"
-OUTPUT_ROOT       = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all"
+# OUTPUT_ROOT: set to the same data_5fold folder organize_5fold.py created
+OUTPUT_ROOT       = "/root/autodl-tmp/suhel/thyroid_nodule/data_5fold"
 
-CLASS_MAP = {               # subfolder_name : label used in output paths
+CLASS_MAP = {                  # subfolder_name : label used in output paths
     "benign":        "benign",
     "malignant":     "malignant",
-    "intermediate":  "intermediate",
+    "indeterminate": "indeterminate",
 }
 
 MAX_FRAMES        = 16      # frames sampled per source
