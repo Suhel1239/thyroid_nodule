@@ -118,16 +118,15 @@ def main():
     src_map = build_source_map(src_root)
     print(f"  Found {len(src_map)} unique entries in source.\n")
 
-    # Walk reference structure: split / cls
-    splits = sorted(d for d in ref_root.iterdir() if d.is_dir())
-    if not splits:
+    # Walk reference structure: cls / cine_folder
+    # (reference is cls-level dirs containing cine folders, no train/val/test split)
+    cls_dirs = sorted(d for d in ref_root.iterdir() if d.is_dir())
+    if not cls_dirs:
         raise SystemExit("[ERROR] No subdirectories found in REFERENCE_ROOT")
 
-    for split_dir in splits:          # train / val / test
-        cls_dirs = sorted(d for d in split_dir.iterdir() if d.is_dir())
-        for cls_dir in cls_dirs:      # benign / malignant / ...
-            out_leaf = out_root / split_dir.name / cls_dir.name
-            process_leaf(cls_dir, src_map, out_leaf, out_root)
+    for cls_dir in cls_dirs:          # benign / malignant / ...
+        out_leaf = out_root / cls_dir.name
+        process_leaf(cls_dir, src_map, out_leaf, out_root)
 
     print("\nDone.")
     print(f"Output: {out_root}/")
