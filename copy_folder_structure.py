@@ -2,39 +2,61 @@
 Copy files from SOURCE_ROOT matching names found in REFERENCE_ROOT,
 preserving the same train/val/test / benign/malignant folder structure.
 
-Reference folder  → defines WHICH filenames to copy (names only, not content)
-Source folder     → WHERE to find the actual files to copy
-Output folder     → destination, mirroring the reference structure
+SOURCE_ROOT does NOT need to mirror the reference structure — all files and
+cine folders are discovered recursively and looked up purely by name.
 
-Works with both video files and cine image sub-folders.
-For cine folders: if the folder name exists in both reference and source, the
-whole folder is copied recursively.
+Reference folder  → defines WHICH filenames/folder-names to copy
+Source folder     → flat or arbitrary structure; searched recursively for matches
+Output folder     → destination, mirroring the reference structure
 
 CONFIG:
     REFERENCE_ROOT  — folder whose filenames are used as the pick-list
-    SOURCE_ROOT     — folder from which matching files/folders are copied
+    SOURCE_ROOT     — folder searched recursively for matching names
     OUTPUT_ROOT     — destination (created if absent)
 """
 
 import shutil
 from pathlib import Path
-from tqdm import tqdm
 
 # ── CONFIG ────────────────────────────────────────────────────────────
-REFERENCE_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/reference_folder"
-SOURCE_ROOT    = "/root/autodl-tmp/suhel/thyroid_nodule/source_folder"
-OUTPUT_ROOT    = "/root/autodl-tmp/suhel/thyroid_nodule/output_folder"
+REFERENCE_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all/train_3_class"
+SOURCE_ROOT    = "/root/autodl-tmp/suhel/thyroid_nodule/enhanced_malignant"
+OUTPUT_ROOT    = "/root/autodl-tmp/suhel/thyroid_nodule/extracted_videos_all/train_3_cl_with_enh_mal"
 # ─────────────────────────────────────────────────────────────────────
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
 
-def collect_names(folder: Path) -> set:
-    """Return the set of entry names (files + dirs) directly inside folder."""
-    if not folder.exists():
-        return set()
-    return {e.name for e in folder.iterdir()}
+def build_source_map(src_root: Path) -> dict[str, Path]:
+    """
+    Recursively scan src_root and build {name: path} for every video file
+    and every cine folder (a directory that directly contains image files).
+    If a name appears more than once the first occurrence wins and a warning
+    is printed.
+    """
+    src_map: dict[str, Path] = {}
+
+    def _warn_dup(name, existing, new):
+        print(f"  [WARNING] duplicate name '{name}' in source — "
+              f"keeping {existing}, ignoring {new}")
+
+    for entry in sorted(src_root.rglob("*")):
+        if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+            if entry.name in src_map:
+                _warn_dup(entry.name, src_map[entry.name], entry)
+            else:
+                src_map[entry.name] = entry
+        elif entry.is_dir():
+            has_imgs = any(f.suffix.lower() in IMAGE_EXTS
+                           for f in entry.iterdir() if f.is_file())
+            if has_imgs:
+                if entry.name in src_map:
+                    _warn_dup(entry.name, src_map[entry.name], entry)
+                else:
+                    src_map[entry.name] = entry
+
+    return src_map
 
 
 def copy_entry(src: Path, dst_dir: Path):
@@ -49,21 +71,16 @@ def copy_entry(src: Path, dst_dir: Path):
         shutil.copytree(src, dst)
 
 
-def process_leaf(ref_leaf: Path, src_leaf: Path, out_leaf: Path):
+def process_leaf(ref_leaf: Path, src_map: dict[str, Path], out_leaf: Path, out_root: Path):
     """
-    ref_leaf, src_leaf, out_leaf are all cls-level dirs
-    (e.g. .../train/benign/).
-    Copy every entry from src_leaf whose name appears in ref_leaf.
+    For every entry in ref_leaf, look it up in the flat src_map by name
+    and copy into out_leaf.
     """
-    ref_names = collect_names(ref_leaf)
+    if not ref_leaf.exists():
+        return
+    ref_names = {e.name for e in ref_leaf.iterdir()}
     if not ref_names:
         return
-
-    # Build a name→path map for the source leaf
-    src_map = {}
-    if src_leaf.exists():
-        for e in src_leaf.iterdir():
-            src_map[e.name] = e
 
     found = 0
     missing = []
@@ -74,7 +91,7 @@ def process_leaf(ref_leaf: Path, src_leaf: Path, out_leaf: Path):
         else:
             missing.append(name)
 
-    rel = out_leaf.relative_to(Path(OUTPUT_ROOT))
+    rel = out_leaf.relative_to(out_root)
     print(f"  {rel}: copied {found}/{len(ref_names)}", end="")
     if missing:
         print(f"  [missing {len(missing)}: {', '.join(missing[:5])}"
@@ -97,6 +114,10 @@ def main():
     print(f"Source    : {src_root}")
     print(f"Output    : {out_root}\n")
 
+    print("Building flat source map (scanning SOURCE_ROOT recursively)...")
+    src_map = build_source_map(src_root)
+    print(f"  Found {len(src_map)} unique entries in source.\n")
+
     # Walk reference structure: split / cls
     splits = sorted(d for d in ref_root.iterdir() if d.is_dir())
     if not splits:
@@ -105,10 +126,8 @@ def main():
     for split_dir in splits:          # train / val / test
         cls_dirs = sorted(d for d in split_dir.iterdir() if d.is_dir())
         for cls_dir in cls_dirs:      # benign / malignant / ...
-            ref_leaf = cls_dir
-            src_leaf = src_root / split_dir.name / cls_dir.name
             out_leaf = out_root / split_dir.name / cls_dir.name
-            process_leaf(ref_leaf, src_leaf, out_leaf)
+            process_leaf(cls_dir, src_map, out_leaf, out_root)
 
     print("\nDone.")
     print(f"Output: {out_root}/")
