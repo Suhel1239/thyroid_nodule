@@ -8,9 +8,10 @@ Excel file must have:
 Output:
     OUTPUT_ROOT/
         benign/
-            folder_a/   ← all images from SOURCE_ROOT/folder_a/
+            folder_a__img001.jpg   ← images flat, prefixed with folder name
+            folder_a__img002.jpg
         malignant/
-            folder_b/
+            folder_b__img001.jpg
         ...
 """
 
@@ -19,12 +20,12 @@ import pandas as pd
 from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────────────────
-EXCEL_FILE  = "/root/autodl-tmp/suhel/thyroid_nodule/labels.xlsx"
-SOURCE_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/source_folders"
-OUTPUT_ROOT = "/root/autodl-tmp/suhel/thyroid_nodule/organized_output"
+EXCEL_FILE  = "/Users/suhelkhan/PyCharmMiscProject/thyroid_nodule/TTSH_nodule_images/koios AI final analysis for medical board.xlsx"
+SOURCE_ROOT = "/Users/suhelkhan/PyCharmMiscProject/thyroid_nodule/TTSH_nodule_images/nodule_images_TTSH"
+OUTPUT_ROOT = "/Users/suhelkhan/PyCharmMiscProject/thyroid_nodule/TTSH_nodule_images/TTSH_images_classified"
 
-FOLDER_COL  = "folder_name"   # column name for folder names in the Excel file
-LABEL_COL   = "label"         # column name for class labels
+FOLDER_COL  = "nodulecode"            # column name for folder names in the Excel file
+LABEL_COL   = "benignniftporca"       # column name for class labels
 
 SHEET_NAME  = 0               # sheet index or name; 0 = first sheet
 # ─────────────────────────────────────────────────────────────────────
@@ -78,18 +79,25 @@ def main():
             skipped += 1
             continue
 
-        dst_folder = out_root / label / folder_name
-        if dst_folder.exists():
-            print(f"  [SKIP already exists] {label}/{folder_name}")
-            skipped += 1
-            continue
+        dst_dir = out_root / label
+        dst_dir.mkdir(parents=True, exist_ok=True)
 
-        dst_folder.mkdir(parents=True, exist_ok=True)
+        n_copied = 0
         for img in imgs:
-            shutil.copy2(img, dst_folder / img.name)
+            # prefix image filename with folder name: foldername__original.jpg
+            new_name = f"{folder_name}__{img.name}"
+            dst = dst_dir / new_name
+            if dst.exists():
+                continue
+            shutil.copy2(img, dst)
+            n_copied += 1
 
-        print(f"  {label}/{folder_name}  ({len(imgs)} images)")
-        copied += 1
+        if n_copied == 0:
+            print(f"  [SKIP all exist] {label}/{folder_name}")
+            skipped += 1
+        else:
+            print(f"  {label}/  ← {folder_name}  ({n_copied} images)")
+            copied += 1
 
     print(f"\nDone.  copied={copied}  skipped={skipped}  missing={missing}")
     print(f"Output: {out_root}/")
