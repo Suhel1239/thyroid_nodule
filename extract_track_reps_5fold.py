@@ -296,34 +296,30 @@ def main():
     model = RFDETRMedium.from_checkpoint(RFDETR_CHECKPOINT)
     print("[RF-DETR] Loaded.\n")
 
-    for split in SPLITS:
-        for cls in CLASSES:
-            src_cls = data_root / split / cls
-            if not src_cls.exists():
-                continue
+    # Collect all video files and cine folders anywhere under data_root
+    sources = []
+    for entry in sorted(data_root.rglob("*")):
+        if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+            rel_parent = entry.parent.relative_to(data_root)
+            save_dir   = output_root / rel_parent / entry.stem
+            sources.append((entry, "video", save_dir))
+        elif entry.is_dir() and entry != data_root:
+            has_imgs = any(f.suffix.lower() in IMAGE_EXTS
+                           for f in entry.iterdir() if f.is_file())
+            if has_imgs:
+                rel_parent = entry.parent.relative_to(data_root)
+                save_dir   = output_root / rel_parent / entry.name
+                sources.append((entry, "cine", save_dir))
 
-            # collect video files and cine folders
-            sources = []
-            for entry in sorted(src_cls.iterdir()):
-                if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
-                    sources.append((entry, "video", entry.stem))
-                elif entry.is_dir():
-                    has_imgs = any(f.suffix.lower() in IMAGE_EXTS
-                                   for f in entry.iterdir() if f.is_file())
-                    if has_imgs:
-                        sources.append((entry, "cine", entry.name))
+    if not sources:
+        raise SystemExit(f"[ERROR] No video files or cine folders found under {data_root}")
 
-            if not sources:
-                continue
+    n_vid  = sum(1 for _, k, _ in sources if k == "video")
+    n_cine = sum(1 for _, k, _ in sources if k == "cine")
+    print(f"\nFound {len(sources)} sources  (videos={n_vid}, cine={n_cine})\n")
 
-            rel = f"{split}/{cls}"
-            n_vid  = sum(1 for _, k, _ in sources if k == "video")
-            n_cine = sum(1 for _, k, _ in sources if k == "cine")
-            print(f"\n  {rel}: {len(sources)} sources  (videos={n_vid}, cine={n_cine})")
-
-            for src_path, kind, stem in tqdm(sources, desc=rel):
-                save_dir = output_root / split / cls / stem
-                process_source(src_path, kind, save_dir, model, sv.ByteTrack)
+    for src_path, kind, save_dir in tqdm(sources, desc="sources"):
+        process_source(src_path, kind, save_dir, model, sv.ByteTrack)
 
     print("\n✅ Done.")
     print(f"   Output: {output_root}/")
