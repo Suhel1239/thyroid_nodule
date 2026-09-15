@@ -40,6 +40,7 @@ RFDETR_CHECKPOINT = "/root/autodl-tmp/suhel/thyroid_nodule/RFDETR_for_ROI/single
 FRAME_STEP              = 1      # process every Nth frame (1 = all frames)
 DETECTOR_THRESHOLD      = 0.10   # RF-DETR detection confidence threshold
 TRACKER_THRESHOLD       = 0.25   # ByteTrack activation threshold
+MIN_SAVE_CONF           = 0.50   # skip source entirely if best frame conf < this
 MIN_TRACK_LONG_AXIS_PX  = 80.0   # reject tracks whose median bbox longest side < this
 MIN_TRACK_OBSERVATIONS  = 10     # reject tracks seen in fewer frames than this
 ROI_SIZE                = 224    # output crop size
@@ -225,6 +226,13 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
 
     if best_chosen is None:
         tqdm.write(f"    {source.name}: no eligible track — skipped")
+        return
+
+    if best_chosen["confidence"] < MIN_SAVE_CONF:
+        tqdm.write(
+            f"    {source.name}: best conf={best_chosen['confidence']:.3f} "
+            f"< {MIN_SAVE_CONF} — skipped"
+        )
         return
 
     save_dir.parent.mkdir(parents=True, exist_ok=True)
