@@ -23,7 +23,6 @@ Output mirrors the same split/class structure:
 """
 
 import cv2
-import json
 import math
 import os
 import sys
@@ -140,9 +139,9 @@ def _stream_frames(source: Path, kind: str):
 # ── Per-source pipeline ───────────────────────────────────────────────
 
 def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
-    save_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = save_dir / "manifest.json"
-    if manifest_path.exists():
+    # Output is a single .jpg named after the source; skip if it already exists.
+    out_jpg = save_dir.parent / f"{save_dir.name}.jpg"
+    if out_jpg.exists():
         tqdm.write(f"    [skip] {source.name}")
         return
 
@@ -159,7 +158,6 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
 
     # ── Frame-by-frame detection + tracking ──────────────────────────
     track_obs: dict[int, list] = defaultdict(list)
-    frame_index = 0
 
     for frame_index, bgr in frame_gen:
         rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -184,7 +182,7 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
 
         for i in range(len(tracked)):
             tid   = int(tracked.tracker_id[i])
-            xyxy  = tuple(tracked.xyxy[i].astype(int))
+            xyxy  = tuple(int(v) for v in tracked.xyxy[i])
             conf  = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
             sharp = _sharpness(bgr, xyxy)
             track_obs[tid].append({
@@ -196,30 +194,19 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
             })
 
     if not track_obs:
-        tqdm.write(f"    {source.name}: no tracked detections")
-        with open(manifest_path, "w") as f:
-            json.dump({"status": "no_tracked_detection", "saved": []}, f, indent=2)
+        tqdm.write(f"    {source.name}: no tracked detections — skipped")
         return
 
-    # ── Select best representative per eligible track ─────────────────
-    saved_files  = []
-    track_summaries = []
+    # ── Pick the single best frame across all eligible tracks ────────
+    best_chosen = None
+    best_score  = None
 
     for tid, obs in sorted(track_obs.items()):
         ordered = sorted(obs, key=lambda x: x["frame_index"])
         median_long = float(np.median([_track_long_axis(o["xyxy"]) for o in ordered]))
 
-        eligible = (median_long >= MIN_TRACK_LONG_AXIS_PX and
-                    len(ordered) >= MIN_TRACK_OBSERVATIONS)
-
-        track_summaries.append({
-            "track_id":            tid,
-            "observation_count":   len(ordered),
-            "median_long_axis_px": round(median_long, 2),
-            "eligible":            eligible,
-        })
-
-        if not eligible:
+        if (median_long < MIN_TRACK_LONG_AXIS_PX or
+                len(ordered) < MIN_TRACK_OBSERVATIONS):
             continue
 
         midpoint = (ordered[0]["frame_index"] + ordered[-1]["frame_index"]) / 2
@@ -229,52 +216,27 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
             x["sharpness"],
             x["confidence"],
             -abs(x["frame_index"] - midpoint),
-            -x["frame_index"],
         ))
 
-        roi = _crop_roi(chosen["bgr"], chosen["xyxy"], PAD_FRAC, ROI_SIZE)
-        fname = f"track_{tid:04d}_best_frame_{chosen['frame_index']:06d}.jpg"
-        cv2.imwrite(str(save_dir / fname), roi)
+        score = (chosen["sharpness"], chosen["confidence"])
+        if best_score is None or score > best_score:
+            best_score  = score
+            best_chosen = chosen
 
-        saved_files.append({
-            "file":        fname,
-            "track_id":    tid,
-            "frame_index": chosen["frame_index"],
-            "sharpness":   round(chosen["sharpness"], 4),
-            "confidence":  round(chosen["confidence"], 4),
-            "xyxy":        list(chosen["xyxy"]),
-            "track_observations":       len(ordered),
-            "middle_observations_used": len(middle),
-            "median_long_axis_px":      round(median_long, 2),
-        })
+    if best_chosen is None:
+        tqdm.write(f"    {source.name}: no eligible track — skipped")
+        return
 
-    status = "selected" if saved_files else "no_eligible_track"
-    with open(manifest_path, "w") as f:
-        json.dump({
-            "status":         status,
-            "source":         source.name,
-            "kind":           kind,
-            "total_frames":   frame_index,
-            "frame_step":     FRAME_STEP,
-            "track_summaries": track_summaries,
-            "saved":          saved_files,
-            "config": {
-                "detector_threshold":     DETECTOR_THRESHOLD,
-                "tracker_threshold":      TRACKER_THRESHOLD,
-                "min_track_long_axis_px": MIN_TRACK_LONG_AXIS_PX,
-                "min_track_observations": MIN_TRACK_OBSERVATIONS,
-                "roi_size":               ROI_SIZE,
-                "selection_rule": (
-                    "middle 20% of track observations, "
-                    "ranked: sharpness > confidence > proximity to midpoint"
-                ),
-            },
-        }, f, indent=2)
+    save_dir.parent.mkdir(parents=True, exist_ok=True)
+    roi = _crop_roi(best_chosen["bgr"], best_chosen["xyxy"], PAD_FRAC, ROI_SIZE)
+    cv2.imwrite(str(out_jpg), roi)
 
     tqdm.write(
         f"    {source.name} [{kind}]: "
-        f"tracks={len(track_obs)}  eligible={len(saved_files)}  "
-        f"status={status}"
+        f"tracks={len(track_obs)}  "
+        f"frame={best_chosen['frame_index']}  "
+        f"sharp={best_chosen['sharpness']:.1f}  "
+        f"conf={best_chosen['confidence']:.3f}  → {out_jpg.name}"
     )
 
 
@@ -301,12 +263,18 @@ def main():
     for entry in sorted(data_root.rglob("*")):
         if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
             rel_parent = entry.parent.relative_to(data_root)
+            # save_dir.parent / save_dir.name + ".jpg" is the output file
             save_dir   = output_root / rel_parent / entry.stem
             sources.append((entry, "video", save_dir))
         elif entry.is_dir() and entry != data_root:
             has_imgs = any(f.suffix.lower() in IMAGE_EXTS
                            for f in entry.iterdir() if f.is_file())
             if has_imgs:
+                # skip directories that are themselves inside a cine folder
+                parent_has_imgs = any(f.suffix.lower() in IMAGE_EXTS
+                                      for f in entry.parent.iterdir() if f.is_file())
+                if parent_has_imgs:
+                    continue
                 rel_parent = entry.parent.relative_to(data_root)
                 save_dir   = output_root / rel_parent / entry.name
                 sources.append((entry, "cine", save_dir))
