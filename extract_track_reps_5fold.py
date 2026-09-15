@@ -228,8 +228,7 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
         return
 
     save_dir.parent.mkdir(parents=True, exist_ok=True)
-    roi = _crop_roi(best_chosen["bgr"], best_chosen["xyxy"], PAD_FRAC, ROI_SIZE)
-    cv2.imwrite(str(out_jpg), roi)
+    cv2.imwrite(str(out_jpg), best_chosen["bgr"])
 
     tqdm.write(
         f"    {source.name} [{kind}]: "
