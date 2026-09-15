@@ -50,6 +50,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # ─────────────────────────────────────────────────────────────────────
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 SPLITS     = ("train", "val", "test")
 CLASSES    = ("benign", "malignant")
 
@@ -94,22 +95,61 @@ def _track_long_axis(xyxy) -> float:
     return max(x2 - x1, y2 - y1)
 
 
-# ── Per-video pipeline ────────────────────────────────────────────────
+# ── Frame streaming (video file or cine folder) ───────────────────────
 
-def process_video(video_path: Path, save_dir: Path, model, tracker_cls):
+def _stream_frames(source: Path, kind: str):
+    """
+    Yields (frame_index, bgr) for every FRAME_STEP-th frame.
+    kind: "video" | "cine"
+    Also returns estimated fps.
+    """
+    if kind == "video":
+        cap = cv2.VideoCapture(str(source))
+        if not cap.isOpened():
+            return 25.0, iter([])
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
+        def _gen():
+            idx = 0
+            while True:
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                if idx % FRAME_STEP == 0:
+                    yield idx, bgr
+                idx += 1
+            cap.release()
+
+        return fps, _gen()
+
+    else:  # cine folder
+        files = sorted(f for f in source.iterdir()
+                       if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+
+        def _gen():
+            for idx, fpath in enumerate(files):
+                if idx % FRAME_STEP != 0:
+                    continue
+                bgr = cv2.imread(str(fpath))
+                if bgr is not None:
+                    yield idx, bgr
+
+        return 25.0, _gen()   # cine folders have no real fps; 25 is fine for tracker
+
+
+# ── Per-source pipeline ───────────────────────────────────────────────
+
+def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
     save_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = save_dir / "manifest.json"
     if manifest_path.exists():
-        tqdm.write(f"    [skip] {video_path.name}")
+        tqdm.write(f"    [skip] {source.name}")
         return
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        tqdm.write(f"    [ERROR] cannot open {video_path.name}")
+    fps, frame_gen = _stream_frames(source, kind)
+    if frame_gen is None:
+        tqdm.write(f"    [ERROR] cannot open {source.name}")
         return
-
-    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     import supervision as sv
     tracker = tracker_cls(
@@ -118,24 +158,16 @@ def process_video(video_path: Path, save_dir: Path, model, tracker_cls):
     )
 
     # ── Frame-by-frame detection + tracking ──────────────────────────
-    track_obs: dict[int, list] = defaultdict(list)   # track_id → list of obs
+    track_obs: dict[int, list] = defaultdict(list)
     frame_index = 0
 
-    while True:
-        ret, bgr = cap.read()
-        if not ret:
-            break
-        if frame_index % FRAME_STEP != 0:
-            frame_index += 1
-            continue
-
+    for frame_index, bgr in frame_gen:
         rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         dets = model.predict(rgb, threshold=DETECTOR_THRESHOLD,
                              include_source_image=False)
         if isinstance(dets, list):
             dets = dets[0]
 
-        # build supervision Detections
         if len(dets) > 0:
             xyxy_arr = dets.xyxy.astype(np.float32)
             conf_arr = dets.confidence.astype(np.float32)
@@ -150,26 +182,21 @@ def process_video(video_path: Path, save_dir: Path, model, tracker_cls):
                                 class_id=cls_arr)
         tracked = tracker.update_with_detections(sv_dets)
 
-        # store each tracked detection with its frame + sharpness
         for i in range(len(tracked)):
-            tid  = int(tracked.tracker_id[i])
-            xyxy = tuple(tracked.xyxy[i].astype(int))
-            conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
+            tid   = int(tracked.tracker_id[i])
+            xyxy  = tuple(tracked.xyxy[i].astype(int))
+            conf  = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
             sharp = _sharpness(bgr, xyxy)
             track_obs[tid].append({
                 "frame_index": frame_index,
                 "xyxy":        xyxy,
                 "confidence":  conf,
                 "sharpness":   sharp,
-                "bgr":         bgr.copy(),    # keep frame for saving
+                "bgr":         bgr.copy(),
             })
 
-        frame_index += 1
-
-    cap.release()
-
     if not track_obs:
-        tqdm.write(f"    {video_path.name}: no tracked detections")
+        tqdm.write(f"    {source.name}: no tracked detections")
         with open(manifest_path, "w") as f:
             json.dump({"status": "no_tracked_detection", "saved": []}, f, indent=2)
         return
@@ -225,7 +252,8 @@ def process_video(video_path: Path, save_dir: Path, model, tracker_cls):
     with open(manifest_path, "w") as f:
         json.dump({
             "status":         status,
-            "video":          video_path.name,
+            "source":         source.name,
+            "kind":           kind,
             "total_frames":   frame_index,
             "frame_step":     FRAME_STEP,
             "track_summaries": track_summaries,
@@ -244,7 +272,7 @@ def process_video(video_path: Path, save_dir: Path, model, tracker_cls):
         }, f, indent=2)
 
     tqdm.write(
-        f"    {video_path.name}: "
+        f"    {source.name} [{kind}]: "
         f"tracks={len(track_obs)}  eligible={len(saved_files)}  "
         f"status={status}"
     )
@@ -274,17 +302,28 @@ def main():
             if not src_cls.exists():
                 continue
 
-            videos = sorted(v for v in src_cls.iterdir()
-                            if v.is_file() and v.suffix.lower() in VIDEO_EXTS)
-            if not videos:
+            # collect video files and cine folders
+            sources = []
+            for entry in sorted(src_cls.iterdir()):
+                if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+                    sources.append((entry, "video", entry.stem))
+                elif entry.is_dir():
+                    has_imgs = any(f.suffix.lower() in IMAGE_EXTS
+                                   for f in entry.iterdir() if f.is_file())
+                    if has_imgs:
+                        sources.append((entry, "cine", entry.name))
+
+            if not sources:
                 continue
 
             rel = f"{split}/{cls}"
-            print(f"\n  {rel}: {len(videos)} videos")
+            n_vid  = sum(1 for _, k, _ in sources if k == "video")
+            n_cine = sum(1 for _, k, _ in sources if k == "cine")
+            print(f"\n  {rel}: {len(sources)} sources  (videos={n_vid}, cine={n_cine})")
 
-            for video_path in tqdm(videos, desc=rel):
-                save_dir = output_root / split / cls / video_path.stem
-                process_video(video_path, save_dir, model, sv.ByteTrack)
+            for src_path, kind, stem in tqdm(sources, desc=rel):
+                save_dir = output_root / split / cls / stem
+                process_source(src_path, kind, save_dir, model, sv.ByteTrack)
 
     print("\n✅ Done.")
     print(f"   Output: {output_root}/")
