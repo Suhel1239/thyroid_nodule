@@ -194,9 +194,8 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
                 "bgr":         bgr.copy(),
             })
 
-    if not track_obs:
-        tqdm.write(f"    {source.name}: no tracked detections — skipped")
-        return
+    # ── Flatten all observations for a global fallback pool ─────────
+    all_obs = [o for obs in track_obs.values() for o in obs]
 
     # ── Pick the single best frame across all eligible tracks ────────
     best_chosen = None
@@ -224,16 +223,15 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
             best_score  = score
             best_chosen = chosen
 
-    if best_chosen is None:
-        tqdm.write(f"    {source.name}: no eligible track — skipped")
-        return
-
-    if best_chosen["confidence"] < MIN_SAVE_CONF:
-        tqdm.write(
-            f"    {source.name}: best conf={best_chosen['confidence']:.3f} "
-            f"< {MIN_SAVE_CONF} — skipped"
-        )
-        return
+    fallback = False
+    if best_chosen is None or best_chosen["confidence"] < MIN_SAVE_CONF:
+        # Fall back to highest-confidence frame across all tracked observations
+        if all_obs:
+            best_chosen = max(all_obs, key=lambda x: (x["confidence"], x["sharpness"]))
+            fallback = True
+        else:
+            tqdm.write(f"    {source.name}: no tracked detections — skipped")
+            return
 
     save_dir.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_jpg), best_chosen["bgr"])
@@ -243,7 +241,9 @@ def process_source(source: Path, kind: str, save_dir: Path, model, tracker_cls):
         f"tracks={len(track_obs)}  "
         f"frame={best_chosen['frame_index']}  "
         f"sharp={best_chosen['sharpness']:.1f}  "
-        f"conf={best_chosen['confidence']:.3f}  → {out_jpg.name}"
+        f"conf={best_chosen['confidence']:.3f}"
+        + ("  [fallback: highest conf]" if fallback else "")
+        + f"  → {out_jpg.name}"
     )
 
 
