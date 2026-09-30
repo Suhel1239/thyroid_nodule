@@ -452,21 +452,29 @@ def train_fold(fold_k: int, device: torch.device) -> dict:
     model.load_state_dict(torch.load(best_path, map_location=device))
 
     # Find Youden-J optimal threshold on val set
+    # Clamp to [0.2, 0.5] to avoid degenerate thresholds on tiny val sets
     val_metrics = evaluate(model, val_loader, criterion, device)
     if len(set(val_metrics["labels"])) > 1:
         fpr, tpr, thresholds = roc_curve(val_metrics["labels"], val_metrics["scores"])
         j_scores = tpr - fpr
-        opt_thresh = float(thresholds[np.argmax(j_scores)])
+        raw_thresh = float(thresholds[np.argmax(j_scores)])
+        opt_thresh = float(np.clip(raw_thresh, 0.2, 0.5))
+        print(f"  Youden-J threshold: raw={raw_thresh:.4f}  clamped={opt_thresh:.4f}")
     else:
-        opt_thresh = 0.5
-    print(f"  Youden-J optimal threshold (from val): {opt_thresh:.4f}")
+        opt_thresh = 0.3
+        print(f"  Val has single class — using fallback threshold={opt_thresh:.4f}")
 
     test_metrics = evaluate(model, test_loader, criterion, device)
+    class_names = [k for k, _ in sorted(LABEL_MAP.items(), key=lambda x: x[1])]
+
+    # Default threshold report
+    print(f"\n  Fold {fold_k} Test Results (threshold=0.50, default):")
+    print(classification_report(test_metrics["labels"], test_metrics["preds"],
+                                 target_names=class_names, zero_division=0))
+
     # Re-apply optimal threshold to test predictions
     test_metrics["preds"] = [int(s >= opt_thresh) for s in test_metrics["scores"]]
-
-    class_names = [k for k, _ in sorted(LABEL_MAP.items(), key=lambda x: x[1])]
-    print(f"\n  Fold {fold_k} Test Results (threshold={opt_thresh:.3f}):")
+    print(f"  Fold {fold_k} Test Results (threshold={opt_thresh:.3f}, Youden-J):")
     print(classification_report(test_metrics["labels"], test_metrics["preds"],
                                  target_names=class_names, zero_division=0))
     print(f"  Test AUC: {test_metrics['auc']:.4f}")
