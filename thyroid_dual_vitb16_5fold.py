@@ -377,7 +377,7 @@ def train_fold(fold_k: int, device: torch.device) -> dict:
     test_ds  = ThyroidDualDataset(str(fold_dir / "test"),  str(roi_dir / "test"),
                                   LABEL_MAP, MAX_FRAMES, IMG_SIZE, ROI_SIZE, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
                               num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
@@ -385,12 +385,19 @@ def train_fold(fold_k: int, device: torch.device) -> dict:
                               num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
 
     model = DualBranchClassifier(num_classes=num_classes, max_frames=MAX_FRAMES,
-                                 freeze_backbone=True, dropout=DROPOUT).to(device)
+                                 freeze_backbone=False, dropout=DROPOUT).to(device)
 
-    counts  = np.bincount([lbl for _, _, lbl, _ in train_ds.samples], minlength=num_classes)
+    train_labels = [lbl for _, _, lbl, _ in train_ds.samples]
+    counts  = np.bincount(train_labels, minlength=num_classes)
     weights = torch.tensor(1.0 / np.where(counts > 0, counts, 1).astype(float),
                            dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+
+    # Over-sample minority class so every batch sees roughly balanced classes
+    sample_weights = torch.tensor(
+        [1.0 / counts[lbl] for lbl in train_labels], dtype=torch.float64)
+    sampler = torch.utils.data.WeightedRandomSampler(
+        sample_weights, num_samples=len(train_labels), replacement=True)
 
     backbone_params = [p for p in model.frame_encoder.backbone.parameters() if p.requires_grad]
     head_params     = (list(model.whole_temporal.parameters()) +
@@ -443,17 +450,32 @@ def train_fold(fold_k: int, device: torch.device) -> dict:
     # ── Test with best checkpoint ────────────────────────────────────
     print(f"\n  Testing fold {fold_k} with best checkpoint...")
     model.load_state_dict(torch.load(best_path, map_location=device))
+
+    # Find Youden-J optimal threshold on val set
+    val_metrics = evaluate(model, val_loader, criterion, device)
+    if len(set(val_metrics["labels"])) > 1:
+        fpr, tpr, thresholds = roc_curve(val_metrics["labels"], val_metrics["scores"])
+        j_scores = tpr - fpr
+        opt_thresh = float(thresholds[np.argmax(j_scores)])
+    else:
+        opt_thresh = 0.5
+    print(f"  Youden-J optimal threshold (from val): {opt_thresh:.4f}")
+
     test_metrics = evaluate(model, test_loader, criterion, device)
+    # Re-apply optimal threshold to test predictions
+    test_metrics["preds"] = [int(s >= opt_thresh) for s in test_metrics["scores"]]
 
     class_names = [k for k, _ in sorted(LABEL_MAP.items(), key=lambda x: x[1])]
-    print(f"\n  Fold {fold_k} Test Results:")
+    print(f"\n  Fold {fold_k} Test Results (threshold={opt_thresh:.3f}):")
     print(classification_report(test_metrics["labels"], test_metrics["preds"],
                                  target_names=class_names, zero_division=0))
     print(f"  Test AUC: {test_metrics['auc']:.4f}")
 
+    test_acc_thresh = np.mean(np.array(test_metrics["preds"]) == np.array(test_metrics["labels"]))
     cm          = confusion_matrix(test_metrics["labels"], test_metrics["preds"])
     sensitivity = cm[1,1] / (cm[1,1] + cm[1,0]) if cm.shape[0] > 1 and (cm[1,1]+cm[1,0]) > 0 else 0.0
     specificity = cm[0,0] / (cm[0,0] + cm[0,1]) if (cm[0,0]+cm[0,1]) > 0 else 0.0
+    test_metrics["accuracy"] = test_acc_thresh
 
     # Save per-fold CSV
     os.makedirs(RESULTS_DIR, exist_ok=True)
