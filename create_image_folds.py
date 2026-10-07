@@ -7,9 +7,9 @@ Matches images to their corresponding video fold by comparing the patient ID
 Example
 -------
 Video in fold_1/train/benign : 10006399578_anon_vid_001.mp4
-  → matching key (part[0])    : "10006399578"
+  → video key (full stem)     : "10006399578_anon_vid_001"
 Images in your image dataset  : 13_10006399578_anon_vid_001.jpg
-  → matching key (part[1])    : "10006399578"  ✓
+  → image key (after 1st _)   : "10006399578_anon_vid_001"  ✓
   → copied to                 : image_folds/fold_1/train/benign/
 
 Folder layout expected
@@ -69,26 +69,20 @@ CLASSES = ["benign", "malignant"]
 
 def video_patient_key(filename: str) -> str:
     """
-    Video files: patient ID is the FIRST underscore-separated part.
-    "10006399578_anon_vid_001.mp4" → "10006399578"
+    Video key = full stem (everything except extension).
+    "10006399578_anon_vid_001.mp4" → "10006399578_anon_vid_001"
     """
-    stem = Path(filename).stem
-    return stem.split("_")[0]
+    return Path(filename).stem
 
 
 def image_patient_key(filename: str) -> str:
     """
-    Image files: patient ID is the SECOND underscore-separated part
-    (images have a numeric prefix before the patient ID).
-    "13_10006501385_anon_vid_001.jpg" → "10006501385"
-    Falls back to first part if there is no second part.
+    Image key = stem after the first underscore (drops the numeric prefix).
+    "13_10006399578_anon_vid_001.jpg" → "10006399578_anon_vid_001"
     """
     stem = Path(filename).stem
-    parts = stem.split("_")
-    # If first part is a short numeric prefix, patient ID is the second part
-    if len(parts) >= 2 and parts[0].isdigit() and len(parts[0]) <= 4:
-        return parts[1]
-    return parts[0]
+    idx = stem.find("_")
+    return stem[idx + 1:] if idx != -1 else stem
 
 
 # ─────────────────────────────────────────────────────────────────────
