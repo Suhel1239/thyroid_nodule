@@ -7,10 +7,9 @@ Matches images to their corresponding video fold by comparing the patient ID
 Example
 -------
 Video in fold_1/train/benign : 10006399578_anon_vid_001.mp4
-  → matching key              : "10006399578"
-Images in your image dataset  : 10006399578_frame_001.jpg
-                                 10006399578_frame_002.jpg
-  → matching key              : "10006399578"  ✓
+  → matching key (part[0])    : "10006399578"
+Images in your image dataset  : 13_10006399578_anon_vid_001.jpg
+  → matching key (part[1])    : "10006399578"  ✓
   → copied to                 : image_folds/fold_1/train/benign/
 
 Folder layout expected
@@ -68,16 +67,28 @@ CLASSES = ["benign", "malignant"]
 # Helper
 # ─────────────────────────────────────────────────────────────────────
 
-def patient_key(filename: str) -> str:
+def video_patient_key(filename: str) -> str:
     """
-    Extract the matching key = everything before the first underscore.
-
-    Examples
-      "10006399578_anon_vid_001.mp4" → "10006399578"
-      "10006399578_frame_001.jpg"    → "10006399578"
+    Video files: patient ID is the FIRST underscore-separated part.
+    "10006399578_anon_vid_001.mp4" → "10006399578"
     """
-    stem = Path(filename).stem          # strip extension
+    stem = Path(filename).stem
     return stem.split("_")[0]
+
+
+def image_patient_key(filename: str) -> str:
+    """
+    Image files: patient ID is the SECOND underscore-separated part
+    (images have a numeric prefix before the patient ID).
+    "13_10006501385_anon_vid_001.jpg" → "10006501385"
+    Falls back to first part if there is no second part.
+    """
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    # If first part is a short numeric prefix, patient ID is the second part
+    if len(parts) >= 2 and parts[0].isdigit() and len(parts[0]) <= 4:
+        return parts[1]
+    return parts[0]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -101,7 +112,7 @@ def build_image_index(image_src_root: str):
             cls_name = cls_dir.name.lower()
             for img in cls_dir.iterdir():
                 if img.is_file() and img.suffix.lower() in IMAGE_EXTS:
-                    key = patient_key(img.name)
+                    key = image_patient_key(img.name)
                     index[(cls_name, key)].append(img)
 
     total = sum(len(v) for v in index.values())
@@ -137,7 +148,7 @@ def build_fold(fold_dir: Path, image_index: dict, out_dir: Path):
             video_keys = set()
             for vf in cls_dir.iterdir():
                 if vf.is_file() and vf.suffix.lower() in VIDEO_EXTS:
-                    video_keys.add(patient_key(vf.name))
+                    video_keys.add(video_patient_key(vf.name))
 
             if not video_keys:
                 print(f"  [WARN] No videos found in {cls_dir} — skipping")
